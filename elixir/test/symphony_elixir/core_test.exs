@@ -1116,6 +1116,18 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.available_slots_for_test(state) == 0
   end
 
+  test "a claimed retry may reuse its own reserved ticket slot" do
+    issue = %Issue{id: "issue-resume", identifier: "MT-558", state: "In Progress"}
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(["issue-resume", "issue-two", "issue-three"])
+    }
+
+    assert Orchestrator.retry_dispatch_slots_available_for_test(issue, state)
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()

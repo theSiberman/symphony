@@ -1650,8 +1650,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
-    available_slots(state) > 0 and state_slots_available?(issue, state.running)
+    retry_available_slots(state, issue.id) > 0 and state_slots_available?(issue, state.running)
   end
+
+  defp retry_available_slots(%State{} = state, issue_id) do
+    max(
+      (state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents) -
+        MapSet.size(MapSet.delete(state.claimed, issue_id)),
+      0
+    )
+  end
+
+  @doc false
+  @spec retry_dispatch_slots_available_for_test(Issue.t(), State.t()) :: boolean()
+  def retry_dispatch_slots_available_for_test(%Issue{} = issue, %State{} = state),
+    do: dispatch_slots_available?(issue, state)
 
   defp apply_codex_token_delta(
          %{codex_totals: codex_totals} = state,
