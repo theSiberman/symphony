@@ -56,6 +56,27 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     assert {:error, :invalid_github_states} =
              GitHubAdapter.validate_config(%{settings | terminal_states: ["open"]})
 
+    assert :ok =
+             GitHubAdapter.validate_config(%{
+               tracker_settings(%{"state_source" => "labels"})
+               | active_states: ["ready-for-agent", "in-progress"],
+                 terminal_states: ["closed", "ready-for-human", "needs-info", "wontfix"]
+             })
+
+    assert {:error, :missing_github_active_states} =
+             GitHubAdapter.validate_config(%{
+               tracker_settings(%{"state_source" => "labels"})
+               | active_states: nil,
+                 terminal_states: ["closed"]
+             })
+
+    assert {:error, :missing_github_repo} =
+             GitHubAdapter.validate_config(%{
+               kind: "github",
+               active_states: ["open"],
+               terminal_states: ["closed"]
+             })
+
     Application.put_env(:symphony_elixir, :github_client_module, FakeGitHubClient)
 
     assert {:ok, ["open"]} = GitHubAdapter.fetch_issues_by_states(["open"])
@@ -92,6 +113,9 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     assert {:error, :invalid_github_api_url} =
              GitHubClient.validate_settings(tracker_settings(%{"api_url" => "http://api.github.com"}))
+
+    assert {:error, :invalid_github_spec_issue_number} =
+             GitHubClient.validate_settings(tracker_settings(%{"spec_issue_number" => "42"}))
 
     assert GitHubClient.secret_environment_names(tracker_settings(%{"token" => "$SYMPHONY_GITHUB_TOKEN"})) == [
              "GITHUB_TOKEN",
@@ -236,6 +260,188 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
                  {:ok, %{status: 200, body: Map.put(raw_issue(3), "title", "")}}
                end
              )
+  end
+
+  test "label-state polling exposes structure and marks issues with open blockers non-dispatchable" do
+    request_fun = fn
+      "GET", "/repos/octo/repo/issues", %{"labels" => label}, nil, _settings ->
+        assert label in ["ready-for-agent", "in-progress"]
+        {:ok, %{status: 200, body: [raw_issue(42), raw_issue(43)]}}
+
+      "GET", "/repos/octo/repo/issues/42/parent", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: raw_issue(7)}}
+
+      "GET", "/repos/octo/repo/issues/43/parent", %{}, nil, _settings ->
+        {:ok, %{status: 404, body: %{"message" => "No parent issue found"}}}
+
+      "GET", "/repos/octo/repo/issues/42/sub_issues", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: []}}
+
+      "GET", "/repos/octo/repo/issues/43/sub_issues", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: [raw_issue(44)]}}
+
+      "GET", "/repos/octo/repo/issues/42/dependencies/blocked_by", %{"page" => 1, "per_page" => 100}, nil, _settings ->
+        {:ok, %{status: 200, body: []}}
+
+      "GET", "/repos/octo/repo/issues/43/dependencies/blocked_by", %{"page" => 1, "per_page" => 100}, nil, _settings ->
+        {:ok, %{status: 200, body: [raw_issue(41)]}}
+    end
+
+    settings = %{
+      tracker_settings(%{"state_source" => "labels"})
+      | active_states: ["ready-for-agent", "in-progress"],
+        terminal_states: ["closed", "ready-for-human", "needs-info", "wontfix"]
+    }
+
+    assert {:ok, issues} =
+             GitHubClient.fetch_issues_by_states_for_test(
+               settings.active_states,
+               settings,
+               request_fun
+             )
+
+    assert length(issues) == 2
+    issue = Enum.find(issues, &(&1.id == "42"))
+    blocked_issue = Enum.find(issues, &(&1.id == "43"))
+
+    assert issue.id == "42"
+    assert issue.state == "ready-for-agent"
+    assert issue.native_ref["parent_number"] == 7
+    assert issue.native_ref["has_parent"]
+    refute issue.native_ref["has_sub_issues"]
+    assert issue.blocked_by == []
+    assert issue.dispatchable
+    refute blocked_issue.dispatchable
+    assert blocked_issue.blocked_by == [%{"id" => 1041, "identifier" => "GH-41", "state" => "open"}]
+  end
+
+  test "label-state refresh returns current structure and blocker snapshots" do
+    refreshed =
+      raw_issue(42)
+      |> Map.put("labels", [%{"name" => "In-Progress"}])
+
+    request_fun = fn
+      "GET", "/repos/octo/repo/issues/42", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: refreshed}}
+
+      "GET", "/repos/octo/repo/issues/42/parent", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: raw_issue(7)}}
+
+      "GET", "/repos/octo/repo/issues/42/sub_issues", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: []}}
+
+      "GET", "/repos/octo/repo/issues/42/dependencies/blocked_by", %{"page" => 1, "per_page" => 100}, nil, _settings ->
+        {:ok, %{status: 200, body: [Map.put(raw_issue(41), "state", "closed"), raw_issue(40)]}}
+    end
+
+    settings = %{
+      tracker_settings(%{"state_source" => "labels"})
+      | active_states: ["ready-for-agent", "in-progress"],
+        terminal_states: ["closed", "ready-for-human", "needs-info", "wontfix"]
+    }
+
+    assert {:ok, [issue]} =
+             GitHubClient.fetch_issues_by_ids_for_test(["42"], settings, request_fun)
+
+    assert issue.state == "In-Progress"
+    assert issue.native_ref["parent_number"] == 7
+    assert issue.blocked_by == [%{"id" => 1040, "identifier" => "GH-40", "state" => "open"}]
+    refute issue.dispatchable
+  end
+
+  test "an in-progress parent with sub-issues is not redispatched" do
+    request_fun = fn
+      "GET", "/repos/octo/repo/issues", %{"labels" => "in-progress"}, nil, _settings ->
+        issue = raw_issue(7) |> Map.put("labels", [%{"name" => "In-Progress"}])
+        {:ok, %{status: 200, body: [issue]}}
+
+      "GET", "/repos/octo/repo/issues/7/parent", %{}, nil, _settings ->
+        {:ok, %{status: 404, body: %{}}}
+
+      "GET", "/repos/octo/repo/issues/7/sub_issues", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: [raw_issue(42)]}}
+
+      "GET", "/repos/octo/repo/issues/7/dependencies/blocked_by", %{"page" => 1, "per_page" => 100}, nil, _settings ->
+        {:ok, %{status: 200, body: []}}
+    end
+
+    settings = %{
+      tracker_settings(%{"state_source" => "labels"})
+      | active_states: ["in-progress"],
+        terminal_states: ["closed", "ready-for-human"]
+    }
+
+    assert {:ok, [issue]} =
+             GitHubClient.fetch_issues_by_states_for_test(["in-progress"], settings, request_fun)
+
+    refute issue.dispatchable
+  end
+
+  test "spec scoping fails closed for unrelated active issues" do
+    request_fun = fn
+      "GET", "/repos/octo/repo/issues", %{"labels" => "ready-for-agent"}, nil, _settings ->
+        {:ok, %{status: 200, body: [raw_issue(42)]}}
+
+      "GET", "/repos/octo/repo/issues/42/parent", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: raw_issue(7)}}
+
+      "GET", "/repos/octo/repo/issues/42/sub_issues", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: []}}
+
+      "GET", "/repos/octo/repo/issues/42/dependencies/blocked_by", %{"page" => 1, "per_page" => 100}, nil, _settings ->
+        {:ok, %{status: 200, body: []}}
+    end
+
+    settings = %{
+      tracker_settings(%{"state_source" => "labels", "spec_issue_number" => 99})
+      | active_states: ["ready-for-agent"],
+        terminal_states: ["closed"]
+    }
+
+    assert {:ok, [issue]} =
+             GitHubClient.fetch_issues_by_states_for_test(
+               ["ready-for-agent"],
+               settings,
+               request_fun
+             )
+
+    refute issue.dispatchable
+  end
+
+  test "label-state polling checks every page of native blockers" do
+    request_fun = fn
+      "GET", "/repos/octo/repo/issues", %{"labels" => "ready-for-agent"}, nil, _settings ->
+        {:ok, %{status: 200, body: [raw_issue(42)]}}
+
+      "GET", "/repos/octo/repo/issues/42/parent", %{}, nil, _settings ->
+        {:ok, %{status: 404, body: %{}}}
+
+      "GET", "/repos/octo/repo/issues/42/sub_issues", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: []}}
+
+      "GET", "/repos/octo/repo/issues/42/dependencies/blocked_by", %{"page" => 1, "per_page" => 100}, nil, _settings ->
+        closed_blockers = Enum.map(1000..1099, &(raw_issue(&1) |> Map.put("state", "closed")))
+        {:ok, %{status: 200, body: closed_blockers}}
+
+      "GET", "/repos/octo/repo/issues/42/dependencies/blocked_by", %{"page" => 2, "per_page" => 100}, nil, _settings ->
+        {:ok, %{status: 200, body: [raw_issue(41)]}}
+    end
+
+    settings = %{
+      tracker_settings(%{"state_source" => "labels"})
+      | active_states: ["ready-for-agent"],
+        terminal_states: ["closed"]
+    }
+
+    assert {:ok, [issue]} =
+             GitHubClient.fetch_issues_by_states_for_test(
+               settings.active_states,
+               settings,
+               request_fun
+             )
+
+    refute issue.dispatchable
+    assert issue.blocked_by == [%{"id" => 1041, "identifier" => "GH-41", "state" => "open"}]
   end
 
   test "github_api preserves REST status and body while rejecting unsafe arguments" do

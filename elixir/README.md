@@ -165,6 +165,9 @@ Notes:
   by the Codex turn sandbox.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.redispatch_on_transition_to` optionally lists active states that end the current worker
+  normally when entered, allowing the orchestrator to run workspace hooks before redispatching the
+  same issue in its new stage.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -246,8 +249,16 @@ codex:
 
 - Config: use `tracker.kind: github` with required `tracker.provider.repo` in `owner/repo` form,
   optional `token` (defaults to `GITHUB_TOKEN` and accepts `$VAR`), and optional `api_url`
-  (default `https://api.github.com`, HTTPS only). Set explicit `active_states` and
-  `terminal_states`; active entries may be `open` and terminal entries may be `closed`.
+  (default `https://api.github.com`, HTTPS only). By default, explicit `active_states` and
+  `terminal_states` use GitHub issue states (`open` and `closed`). Set
+  `tracker.provider.state_source: labels` to use labels as workflow states instead; then list the
+  active and terminal label names in `active_states` and `terminal_states`. Comparisons ignore case,
+  while the provider's original label spelling is retained on the normalized issue.
+- Frontier and scope: label-state polling follows all pages of GitHub's native `blocked_by`
+  relationship. An issue with any open blocker remains visible but is non-dispatchable; it becomes
+  eligible on the first poll after its final blocker closes. Dispatch is revalidated immediately
+  before launch. Optional `tracker.provider.spec_issue_number` limits dispatch to that issue and
+  its direct sub-issues; `0` intentionally matches no issues.
 - Reads and identity: polling is scoped to the configured repository; `issue.id` is the
   repository issue number, `issue.identifier` is `GH-<number>`, hidden or deleted `404` issues are
   omitted on refresh, and pull requests returned by the Issues API are not dispatchable.
@@ -255,6 +266,8 @@ codex:
   `body`; Symphony executes it host-side with the session-bound token, removes configured tracker
   credentials and provider authentication aliases from the Codex child, and leaves raw tool access
   limited by that token's GitHub permissions.
+- Hooks receive `SYMPHONY_ISSUE_ID` and `SYMPHONY_ISSUE_IDENTIFIER` for the current issue in
+  addition to the documented workspace environment.
 
 ### Jira Cloud adapter
 

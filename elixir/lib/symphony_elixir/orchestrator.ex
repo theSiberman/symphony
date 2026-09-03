@@ -42,6 +42,8 @@ defmodule SymphonyElixir.Orchestrator do
       codex_totals: nil,
       codex_rate_limits: nil
     ]
+
+    @type t :: %__MODULE__{}
   end
 
   @doc false
@@ -651,7 +653,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+    Map.get(running_entry, :last_codex_timestamp)
   end
 
   defp last_activity_timestamp(_running_entry), do: nil
@@ -1375,6 +1377,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec available_slots_for_test(State.t()) :: non_neg_integer()
   def available_slots_for_test(%State{} = state), do: available_slots(state)
 
   @spec request_refresh() :: map() | :unavailable

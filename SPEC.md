@@ -622,6 +622,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.timeout_ms`: integer, default `60000`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
+- `agent.redispatch_on_transition_to`: list of provider-native active state names, default `[]`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
@@ -666,6 +667,9 @@ Important nuance:
 - After each normal turn completion, the worker re-checks the tracker issue state.
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
   coding-agent thread in the same workspace, up to `agent.max_turns`.
+- When the issue transitions into a state listed in `agent.redispatch_on_transition_to`, the worker
+  SHOULD exit normally so the orchestrator can redispatch it through workspace hooks with the new
+  stage. A worker that began in that state MAY continue while the state remains unchanged.
 - The first turn SHOULD use the full rendered task prompt.
 - Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
   original task prompt that is already present in thread history.

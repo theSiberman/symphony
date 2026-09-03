@@ -156,10 +156,10 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
-          {:continue, refreshed_issue}
-        else
+        if redispatch_transition?(issue.state, refreshed_issue.state) do
           {:done, refreshed_issue}
+        else
+          continue_or_finish(refreshed_issue)
         end
 
       {:ok, []} ->
@@ -172,6 +172,14 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
 
+  defp continue_or_finish(refreshed_issue) do
+    if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
+      {:continue, refreshed_issue}
+    else
+      {:done, refreshed_issue}
+    end
+  end
+
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
 
@@ -180,6 +188,17 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp active_issue_state?(_state_name), do: false
+
+  defp redispatch_transition?(previous_state, refreshed_state)
+       when is_binary(previous_state) and is_binary(refreshed_state) do
+    previous_state = normalize_issue_state(previous_state)
+    refreshed_state = normalize_issue_state(refreshed_state)
+
+    previous_state != refreshed_state and
+      refreshed_state in Config.settings!().agent.redispatch_on_transition_to
+  end
+
+  defp redispatch_transition?(_previous_state, _refreshed_state), do: false
 
   defp issue_routable?(%Issue{} = issue) do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)

@@ -75,18 +75,194 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp fetch_issues_by_states(state_names, tracker_settings, request_fun) do
-    normalized_states = state_names |> Enum.map(&normalize_state/1) |> MapSet.new()
+    normalized_state_names = state_names |> Enum.map(&normalize_state/1) |> Enum.uniq()
+    normalized_states = MapSet.new(normalized_state_names)
 
-    case github_state_query(normalized_states) do
-      nil ->
-        {:ok, []}
-
-      state_query ->
-        with {:ok, github_settings} <- settings(tracker_settings) do
-          do_fetch_pages(github_settings, state_query, normalized_states, 1, request_fun, [])
-        end
+    with {:ok, github_settings} <- settings(tracker_settings) do
+      fetch_states_with_settings(
+        normalized_state_names,
+        normalized_states,
+        github_settings,
+        tracker_settings,
+        request_fun
+      )
     end
   end
+
+  defp fetch_states_with_settings(
+         state_names,
+         _states,
+         settings,
+         %{provider: %{"state_source" => "labels"}},
+         request_fun
+       ) do
+    fetch_label_state_pages(state_names, settings, request_fun)
+  end
+
+  defp fetch_states_with_settings(_state_names, states, settings, _tracker_settings, request_fun) do
+    case github_state_query(states) do
+      nil -> {:ok, []}
+      query -> do_fetch_pages(settings, query, states, 1, request_fun, [])
+    end
+  end
+
+  defp fetch_label_state_pages(states, settings, request_fun) do
+    Enum.reduce_while(states, {:ok, %{}}, fn state, {:ok, issues_by_id} ->
+      case do_fetch_label_pages(settings, state, 1, request_fun, []) do
+        {:ok, issues} ->
+          merged = Enum.reduce(issues, issues_by_id, &Map.put_new(&2, &1.id, &1))
+          {:cont, {:ok, merged}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, issues_by_id} -> enrich_and_filter_candidates(Map.values(issues_by_id), settings, request_fun)
+      error -> error
+    end
+  end
+
+  defp do_fetch_label_pages(settings, label, page, request_fun, acc) do
+    params = %{
+      "state" => "open",
+      "labels" => label,
+      "per_page" => @page_size,
+      "page" => page,
+      "sort" => "created",
+      "direction" => "asc"
+    }
+
+    with {:ok, payload} <-
+           request_with_settings(
+             "GET",
+             repository_issues_path(settings),
+             params,
+             nil,
+             settings,
+             request_fun,
+             false
+           ) do
+      issues =
+        payload
+        |> Enum.map(&normalize_issue(&1, settings.repo, matching_label(&1, label) || label))
+        |> Enum.reject(&is_nil/1)
+
+      updated_acc = [issues | acc]
+
+      if length(payload) < @page_size do
+        {:ok, updated_acc |> Enum.reverse() |> List.flatten()}
+      else
+        do_fetch_label_pages(settings, label, page + 1, request_fun, updated_acc)
+      end
+    end
+  end
+
+  defp enrich_and_filter_candidates(issues, settings, request_fun) do
+    Enum.reduce_while(issues, {:ok, []}, fn issue, {:ok, acc} ->
+      issue
+      |> enrich_issue(settings, request_fun)
+      |> reduce_enriched_candidate(acc, settings)
+    end)
+    |> case do
+      {:ok, enriched} -> {:ok, Enum.reverse(enriched)}
+      error -> error
+    end
+  end
+
+  defp reduce_enriched_candidate({:ok, %Issue{} = issue}, acc, _settings),
+    do: {:cont, {:ok, [issue | acc]}}
+
+  defp reduce_enriched_candidate({:error, reason}, _acc, _settings), do: {:halt, {:error, reason}}
+
+  defp dispatch_candidate?(issue, %{spec_issue_number: scope})
+       when is_integer(scope) and scope >= 0 do
+    in_spec_scope?(issue, scope) and resumable_candidate?(issue)
+  end
+
+  defp dispatch_candidate?(issue, _settings), do: resumable_candidate?(issue)
+
+  defp in_spec_scope?(_issue, 0), do: false
+
+  defp in_spec_scope?(%Issue{id: id, native_ref: native_ref}, scope) do
+    id == Integer.to_string(scope) or Map.get(native_ref, "parent_number") == scope
+  end
+
+  defp resumable_candidate?(%Issue{state: state, native_ref: native_ref}) when is_map(native_ref) do
+    normalize_state(state) != "in-progress" or native_ref["has_sub_issues"] != true
+  end
+
+  defp resumable_candidate?(%Issue{}), do: true
+
+  defp enrich_issue(%Issue{id: id} = issue, settings, request_fun) do
+    base_path = repository_issue_path(settings, String.to_integer(id))
+
+    with {:ok, parent} <-
+           request_with_settings("GET", base_path <> "/parent", %{}, nil, settings, request_fun, true),
+         {:ok, sub_issues} <-
+           request_with_settings("GET", base_path <> "/sub_issues", %{}, nil, settings, request_fun, false),
+         {:ok, blockers} <-
+           fetch_list_pages(
+             base_path <> "/dependencies/blocked_by",
+             settings,
+             request_fun,
+             1,
+             []
+           ) do
+      enrich_issue_payload(issue, parent, sub_issues, blockers, settings)
+    end
+  end
+
+  defp enrich_issue_payload(issue, parent, sub_issues, blockers, settings) do
+    parent_number = if is_map(parent), do: parent["number"], else: nil
+    sub_issue_numbers = Enum.flat_map(sub_issues, &positive_issue_number/1)
+
+    native_ref =
+      (issue.native_ref || %{})
+      |> Map.put("has_parent", is_integer(parent_number))
+      |> Map.put("parent_number", parent_number)
+      |> Map.put("has_sub_issues", sub_issue_numbers != [])
+      |> Map.put("sub_issue_numbers", sub_issue_numbers)
+
+    normalized_blockers =
+      blockers
+      |> Enum.filter(&(&1["state"] != "closed"))
+      |> Enum.map(fn blocker ->
+        %{
+          "id" => blocker["id"],
+          "identifier" => if(is_integer(blocker["number"]), do: "GH-#{blocker["number"]}"),
+          "state" => blocker["state"]
+        }
+      end)
+
+    enriched = %{issue | native_ref: native_ref, blocked_by: normalized_blockers}
+
+    {:ok,
+     %{
+       enriched
+       | dispatchable:
+           enriched.dispatchable and normalized_blockers == [] and
+             dispatch_candidate?(enriched, settings)
+     }}
+  end
+
+  defp fetch_list_pages(path, settings, request_fun, page, acc) do
+    params = %{"per_page" => @page_size, "page" => page}
+
+    with {:ok, payload} <-
+           request_with_settings("GET", path, params, nil, settings, request_fun, false) do
+      updated_acc = [payload | acc]
+
+      if length(payload) < @page_size do
+        {:ok, updated_acc |> Enum.reverse() |> List.flatten()}
+      else
+        fetch_list_pages(path, settings, request_fun, page + 1, updated_acc)
+      end
+    end
+  end
+
+  defp positive_issue_number(%{"number" => number}) when is_integer(number) and number > 0, do: [number]
+  defp positive_issue_number(_issue), do: []
 
   defp fetch_issues_by_ids(issue_ids, tracker_settings, request_fun) do
     ids = Enum.uniq(issue_ids)
@@ -97,7 +273,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
       ids ->
         with {:ok, github_settings} <- settings(tracker_settings) do
-          fetch_issue_ids(ids, github_settings, request_fun, [])
+          fetch_issue_ids(ids, github_settings, tracker_settings, request_fun, [])
         end
     end
   end
@@ -120,8 +296,7 @@ defmodule SymphonyElixir.GitHub.Client do
              settings,
              request_fun,
              false
-           ),
-         true <- is_list(payload) or {:error, :github_unknown_payload} do
+           ) do
       issues = normalize_state_page(payload, settings.repo, requested_states)
       updated_acc = [issues | acc]
 
@@ -133,9 +308,10 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp fetch_issue_ids([], _settings, _request_fun, acc), do: {:ok, Enum.reverse(acc)}
+  defp fetch_issue_ids([], _settings, _tracker_settings, _request_fun, acc),
+    do: {:ok, Enum.reverse(acc)}
 
-  defp fetch_issue_ids([id | rest], settings, request_fun, acc) do
+  defp fetch_issue_ids([id | rest], settings, tracker_settings, request_fun, acc) do
     with {:ok, issue_number} <- parse_issue_number(id),
          {:ok, payload} <-
            request_with_settings(
@@ -147,23 +323,66 @@ defmodule SymphonyElixir.GitHub.Client do
              request_fun,
              true
            ) do
-      continue_issue_id_fetch(payload, rest, settings, request_fun, acc)
+      continue_issue_id_fetch(payload, rest, settings, tracker_settings, request_fun, acc)
     end
   end
 
-  defp continue_issue_id_fetch(:not_found, rest, settings, request_fun, acc) do
-    fetch_issue_ids(rest, settings, request_fun, acc)
+  defp continue_issue_id_fetch(:not_found, rest, settings, tracker_settings, request_fun, acc) do
+    fetch_issue_ids(rest, settings, tracker_settings, request_fun, acc)
   end
 
-  defp continue_issue_id_fetch(%{} = raw_issue, rest, settings, request_fun, acc) do
-    case normalize_issue(raw_issue, settings.repo) do
-      %Issue{} = issue -> fetch_issue_ids(rest, settings, request_fun, [issue | acc])
-      nil -> {:error, :github_unknown_payload}
+  defp continue_issue_id_fetch(
+         %{} = raw_issue,
+         rest,
+         settings,
+         tracker_settings,
+         request_fun,
+         acc
+       ) do
+    state_override = issue_state(raw_issue, tracker_settings)
+
+    case normalize_issue(raw_issue, settings.repo, state_override) do
+      %Issue{} = issue ->
+        with {:ok, issue} <- maybe_enrich_refresh(issue, settings, tracker_settings, request_fun) do
+          fetch_issue_ids(rest, settings, tracker_settings, request_fun, [issue | acc])
+        end
+
+      nil ->
+        {:error, :github_unknown_payload}
     end
   end
 
-  defp continue_issue_id_fetch(_payload, _rest, _settings, _request_fun, _acc) do
+  defp continue_issue_id_fetch(
+         _payload,
+         _rest,
+         _settings,
+         _tracker_settings,
+         _request_fun,
+         _acc
+       ) do
     {:error, :github_unknown_payload}
+  end
+
+  defp maybe_enrich_refresh(issue, settings, tracker_settings, request_fun) do
+    if label_states?(tracker_settings) do
+      enrich_issue(issue, settings, request_fun)
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp issue_state(%{"state" => "closed"}, _tracker_settings), do: "closed"
+
+  defp issue_state(raw_issue, tracker_settings) do
+    if label_states?(tracker_settings) do
+      (tracker_settings.active_states ++ tracker_settings.terminal_states)
+      |> Enum.reject(&(normalize_state(&1) == "closed"))
+      |> Enum.find_value(&matching_label(raw_issue, &1))
+    end
+  end
+
+  defp matching_label(raw_issue, expected_label) do
+    Enum.find(provider_labels(raw_issue), &(normalize_state(&1) == normalize_state(expected_label)))
   end
 
   defp normalize_state_page(payload, repo, requested_states) do
@@ -179,9 +398,11 @@ defmodule SymphonyElixir.GitHub.Client do
     |> Enum.filter(&MapSet.member?(requested_states, normalize_state(&1.state)))
   end
 
-  defp normalize_issue(issue, repo) when is_map(issue) and is_binary(repo) do
+  defp normalize_issue(issue, repo, state_override \\ nil)
+
+  defp normalize_issue(issue, repo, state_override) when is_map(issue) and is_binary(repo) do
     issue_number = issue["number"]
-    state = issue["state"]
+    state = state_override || issue["state"]
 
     if is_integer(issue_number) and issue_number > 0 and
          Enum.all?([issue["title"], state], &present_string?/1) do
@@ -203,7 +424,7 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp normalize_issue(_issue, _repo), do: nil
+  defp normalize_issue(_issue, _repo, _state_override), do: nil
 
   defp native_ref(issue, repo) do
     %{
@@ -220,19 +441,26 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp extract_labels(%{"labels" => labels}) when is_list(labels) do
+  defp provider_labels(%{"labels" => labels}) when is_list(labels) do
     labels
     |> Enum.flat_map(fn
       %{"name" => name} when is_binary(name) -> [name]
       name when is_binary(name) -> [name]
       _ -> []
     end)
-    |> Enum.map(&(String.trim(&1) |> String.downcase()))
+    |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq()
   end
 
-  defp extract_labels(_issue), do: []
+  defp provider_labels(_issue), do: []
+
+  defp extract_labels(issue) do
+    issue
+    |> provider_labels()
+    |> Enum.map(&String.downcase/1)
+    |> Enum.uniq()
+  end
 
   defp parse_datetime(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
@@ -287,13 +515,32 @@ defmodule SymphonyElixir.GitHub.Client do
     api_url = provider["api_url"] || @default_api_url
     repo = resolve_setting(provider["repo"], System.get_env("GITHUB_REPO"))
     token = resolve_setting(provider["token"], System.get_env("GITHUB_TOKEN"))
+    spec_issue_number = provider["spec_issue_number"]
 
     cond do
-      not valid_api_url?(api_url) -> {:error, :invalid_github_api_url}
-      not present_string?(repo) -> {:error, :missing_github_repo}
-      not valid_repo?(repo) -> {:error, :invalid_github_repo}
-      not present_string?(token) -> {:error, :missing_github_token}
-      true -> {:ok, %{api_url: String.trim_trailing(api_url, "/"), repo: repo, token: token}}
+      not valid_api_url?(api_url) ->
+        {:error, :invalid_github_api_url}
+
+      not present_string?(repo) ->
+        {:error, :missing_github_repo}
+
+      not valid_repo?(repo) ->
+        {:error, :invalid_github_repo}
+
+      not present_string?(token) ->
+        {:error, :missing_github_token}
+
+      not valid_spec_issue_number?(spec_issue_number) ->
+        {:error, :invalid_github_spec_issue_number}
+
+      true ->
+        {:ok,
+         %{
+           api_url: String.trim_trailing(api_url, "/"),
+           repo: repo,
+           token: token,
+           spec_issue_number: spec_issue_number
+         }}
     end
   end
 
@@ -338,6 +585,8 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp valid_api_url?(_value), do: false
+  defp valid_spec_issue_number?(nil), do: true
+  defp valid_spec_issue_number?(value), do: is_integer(value) and value >= 0
   defp valid_repo?(repo) when is_binary(repo), do: String.match?(repo, ~r/^[^\s\/]+\/[^\s\/]+$/)
   defp valid_repo?(_repo), do: false
 
@@ -372,6 +621,9 @@ defmodule SymphonyElixir.GitHub.Client do
       true -> nil
     end
   end
+
+  defp label_states?(tracker_settings),
+    do: provider_settings(tracker_settings)["state_source"] == "labels"
 
   defp parse_issue_number(value) when is_binary(value) do
     case Integer.parse(value) do

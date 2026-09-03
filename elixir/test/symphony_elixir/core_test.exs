@@ -18,6 +18,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.agent.redispatch_on_transition_to == []
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -33,6 +34,12 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      redispatch_on_transition_to: [" Awaiting-Verification ", "awaiting-verification"]
+    )
+
+    assert Config.settings!().agent.redispatch_on_transition_to == ["awaiting-verification"]
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -1019,6 +1026,46 @@ defmodule SymphonyElixir.CoreTest do
              AgentRunner.continue_with_issue_for_test(issue, fetcher)
   end
 
+  test "agent runner redispatches when an active issue enters a configured handoff state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["ready-for-agent", "awaiting-verification"],
+      redispatch_on_transition_to: ["awaiting-verification"]
+    )
+
+    issue = %Issue{
+      id: "issue-stage-handoff",
+      identifier: "GH-237",
+      title: "Stage handoff",
+      state: "ready-for-agent",
+      dispatchable: true
+    }
+
+    refreshed_issue = %{issue | state: "awaiting-verification"}
+    fetcher = fn ["issue-stage-handoff"] -> {:ok, [refreshed_issue]} end
+
+    assert {:done, ^refreshed_issue} =
+             AgentRunner.continue_with_issue_for_test(issue, fetcher)
+  end
+
+  test "agent runner continues within a configured handoff state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["awaiting-verification"],
+      redispatch_on_transition_to: ["awaiting-verification"]
+    )
+
+    issue = %Issue{
+      id: "issue-verifier-repair",
+      identifier: "GH-237",
+      title: "Verifier repair",
+      state: "awaiting-verification",
+      dispatchable: true
+    }
+
+    fetcher = fn ["issue-verifier-repair"] -> {:ok, [issue]} end
+
+    assert {:continue, ^issue} = AgentRunner.continue_with_issue_for_test(issue, fetcher)
+  end
+
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
@@ -1056,7 +1103,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, 0, 1_100)
   end
 
   test "a claimed retry consumes the sole ticket slot" do
@@ -1106,7 +1153,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 38_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do

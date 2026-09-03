@@ -13,18 +13,8 @@ defmodule SymphonyElixir.GitHub.Adapter do
 
   @spec validate_config(map()) :: :ok | {:error, term()}
   def validate_config(tracker_settings) do
-    with :ok <-
-           validate_states(
-             tracker_settings.active_states,
-             @active_states,
-             :missing_github_active_states
-           ),
-         :ok <-
-           validate_states(
-             tracker_settings.terminal_states,
-             @terminal_states,
-             :missing_github_terminal_states
-           ) do
+    with :ok <- validate_active_states(tracker_settings),
+         :ok <- validate_terminal_states(tracker_settings) do
       Client.validate_settings(tracker_settings)
     end
   end
@@ -47,6 +37,39 @@ defmodule SymphonyElixir.GitHub.Adapter do
   defp client_module do
     Application.get_env(:symphony_elixir, :github_client_module, Client)
   end
+
+  defp validate_active_states(%{active_states: states} = settings) do
+    if label_state_source?(settings) do
+      validate_label_states(states, :missing_github_active_states, false)
+    else
+      validate_states(states, @active_states, :missing_github_active_states)
+    end
+  end
+
+  defp validate_terminal_states(%{terminal_states: states} = settings) do
+    if label_state_source?(settings) do
+      validate_label_states(states, :missing_github_terminal_states, true)
+    else
+      validate_states(states, @terminal_states, :missing_github_terminal_states)
+    end
+  end
+
+  defp validate_label_states(states, _missing_error, allow_closed?) when is_list(states) do
+    valid? =
+      Enum.all?(states, fn state ->
+        normalized = normalize_state(state)
+        normalized != "" and (allow_closed? or normalized != "closed")
+      end)
+
+    if valid?, do: :ok, else: {:error, :invalid_github_states}
+  end
+
+  defp validate_label_states(_states, missing_error, _allow_closed?), do: {:error, missing_error}
+
+  defp label_state_source?(%{provider: provider}) when is_map(provider),
+    do: provider["state_source"] == "labels"
+
+  defp label_state_source?(_settings), do: false
 
   defp validate_states(states, allowed_states, _missing_error) when is_list(states) do
     if Enum.all?(states, &(normalize_state(&1) in allowed_states)) do

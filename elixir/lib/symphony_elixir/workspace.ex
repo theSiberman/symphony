@@ -401,7 +401,11 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command],
+          cd: workspace,
+          stderr_to_stdout: true,
+          env: hook_environment(issue_context)
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -419,10 +423,15 @@ defmodule SymphonyElixir.Workspace do
 
   defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
     timeout_ms = Config.settings!().hooks.timeout_ms
+    remote_command = hook_environment_script(issue_context) <> "\n" <> command
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    case run_remote_command(
+           worker_host,
+           "cd #{shell_escape(workspace)} && #{remote_command}",
+           timeout_ms
+         ) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -591,5 +600,17 @@ defmodule SymphonyElixir.Workspace do
 
   defp issue_log_context(%{issue_id: issue_id, issue_identifier: issue_identifier}) do
     "issue_id=#{issue_id || "n/a"} issue_identifier=#{issue_identifier || "issue"}"
+  end
+
+  defp hook_environment(%{issue_id: issue_id, issue_identifier: issue_identifier}) do
+    [
+      {"SYMPHONY_ISSUE_ID", issue_id || ""},
+      {"SYMPHONY_ISSUE_IDENTIFIER", issue_identifier || "issue"}
+    ]
+  end
+
+  defp hook_environment_script(issue_context) do
+    hook_environment(issue_context)
+    |> Enum.map_join("\n", fn {name, value} -> "export #{name}=#{shell_escape(value)}" end)
   end
 end

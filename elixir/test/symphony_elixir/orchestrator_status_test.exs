@@ -903,6 +903,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   test "orchestrator restarts stalled workers with retry backoff" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
+      tracker_active_states: ["In Progress"],
       codex_stall_timeout_ms: 1_000
     )
 
@@ -970,6 +971,67 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
     assert remaining_ms >= 9_500
     assert remaining_ms <= 10_500
+  end
+
+  test "orchestrator does not classify a worker hook as stalled before Codex starts" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["In Progress"],
+      codex_stall_timeout_ms: 1_000
+    )
+
+    issue_id = "issue-hook-running"
+    orchestrator_name = Module.concat(__MODULE__, :HookRunningOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    stale_started_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: "MT-HOOK",
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-HOOK",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-HOOK",
+        dispatchable: true
+      },
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      started_at: stale_started_at
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_entry.issue])
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    assert Process.alive?(worker_pid)
+    assert Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+
+    send(worker_pid, :done)
   end
 
   test "orchestrator blocks stalled workers that are waiting on MCP elicitation" do

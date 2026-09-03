@@ -878,7 +878,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "echo after_create > after_create.log\necho call >> \"#{after_create_counter}\"",
+        hook_after_create: "echo after_create > after_create.log\nprintf '%s\\t%s\\n' \"$SYMPHONY_ISSUE_ID\" \"$SYMPHONY_ISSUE_IDENTIFIER\" > hook-env.log\necho call >> \"#{after_create_counter}\"",
         hook_before_remove: "echo before_remove > \"#{before_remove_marker}\""
       )
 
@@ -886,10 +886,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert config.hooks.after_create =~ "echo after_create > after_create.log"
       assert config.hooks.before_remove =~ "echo before_remove >"
 
-      assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS")
+      issue = %Issue{id: "42", identifier: "MT-HOOKS"}
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
       assert File.read!(Path.join(workspace, "after_create.log")) == "after_create\n"
+      assert File.read!(Path.join(workspace, "hook-env.log")) == "42\tMT-HOOKS\n"
 
-      assert {:ok, _workspace} = Workspace.create_for_issue("MT-HOOKS")
+      assert {:ok, _workspace} = Workspace.create_for_issue(issue)
       assert length(String.split(String.trim(File.read!(after_create_counter)), "\n")) == 1
 
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS")
