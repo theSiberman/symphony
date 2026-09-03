@@ -1369,10 +1369,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp available_slots(%State{} = state) do
     max(
       (state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents) -
-        map_size(state.running),
+        MapSet.size(state.claimed),
       0
     )
   end
+
+  @doc false
+  def available_slots_for_test(%State{} = state), do: available_slots(state)
 
   @spec request_refresh() :: map() | :unavailable
   def request_refresh do

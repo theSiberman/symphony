@@ -1059,6 +1059,16 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
+  test "a claimed retry consumes the sole ticket slot" do
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(["issue-resume"])
+    }
+
+    assert Orchestrator.available_slots_for_test(state) == 0
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
