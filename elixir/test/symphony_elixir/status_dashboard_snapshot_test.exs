@@ -194,6 +194,21 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     Snapshot.assert_dashboard_snapshot!("credits_unlimited", render_snapshot(snapshot_data, 42.0))
   end
 
+  test "stale snapshot preserves the last successful agent state" do
+    snapshot = %{
+      running: [running_entry(%{identifier: "MT-254"})],
+      retrying: [],
+      codex_totals: %{input_tokens: 90, output_tokens: 12, total_tokens: 102, seconds_running: 75},
+      rate_limits: nil
+    }
+
+    rendered = render_snapshot({:stale, snapshot}, 0.0)
+
+    assert rendered =~ "MT-254"
+    assert rendered =~ "last successful snapshot"
+    refute rendered =~ "Orchestrator snapshot unavailable"
+  end
+
   defp render_snapshot(snapshot_data, tps) do
     StatusDashboard.format_snapshot_content_for_test(snapshot_data, tps, @terminal_columns)
   end

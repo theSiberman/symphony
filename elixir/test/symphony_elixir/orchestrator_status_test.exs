@@ -1452,6 +1452,75 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute_receive {:render, _third_render_ms, _content}, 60
   end
 
+  test "status dashboard preserves a successful snapshot through unavailability and replaces it on recovery" do
+    dashboard_name = Module.concat(__MODULE__, :SnapshotRecoveryDashboard)
+    parent = self()
+    {:ok, snapshot_state} = Agent.start_link(fn -> :old end)
+
+    snapshot_fun = fn ->
+      identifier = Agent.get(snapshot_state, & &1)
+
+      case identifier do
+        :unavailable ->
+          :error
+
+        identifier ->
+          {:ok,
+           %{
+             running: [
+               %{
+                 identifier: to_string(identifier),
+                 state: "running",
+                 session_id: nil,
+                 codex_app_server_pid: nil,
+                 codex_total_tokens: 0,
+                 runtime_seconds: 0,
+                 turn_count: 0,
+                 last_codex_event: nil,
+                 last_codex_message: nil
+               }
+             ],
+             retrying: [],
+             codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+             rate_limits: nil,
+             polling: nil
+           }}
+      end
+    end
+
+    {:ok, dashboard_pid} =
+      StatusDashboard.start_link(
+        name: dashboard_name,
+        enabled: true,
+        refresh_ms: 60_000,
+        render_interval_ms: 0,
+        snapshot_fun: snapshot_fun,
+        settings_fun: fn -> exit(:workflow_store_unavailable) end,
+        render_fun: fn content -> send(parent, {:snapshot_recovery_render, content}) end
+      )
+
+    on_exit(fn ->
+      if Process.alive?(dashboard_pid), do: Process.exit(dashboard_pid, :normal)
+      if Process.alive?(snapshot_state), do: Process.exit(snapshot_state, :normal)
+    end)
+
+    StatusDashboard.notify_update(dashboard_name)
+    assert_receive {:snapshot_recovery_render, first_render}, 500
+    assert first_render =~ "old"
+
+    Agent.update(snapshot_state, fn _ -> :unavailable end)
+    StatusDashboard.notify_update(dashboard_name)
+    assert_receive {:snapshot_recovery_render, stale_render}, 500
+    assert stale_render =~ "old"
+    assert stale_render =~ "last successful snapshot"
+
+    Agent.update(snapshot_state, fn _ -> :new end)
+    StatusDashboard.notify_update(dashboard_name)
+    assert_receive {:snapshot_recovery_render, recovered_render}, 500
+    assert recovered_render =~ "new"
+    refute recovered_render =~ "last successful snapshot"
+  end
+
   test "status dashboard computes rolling 5-second token throughput" do
     assert StatusDashboard.rolling_tps([], 10_000, 0) == 0.0
 

@@ -46,6 +46,10 @@ defmodule SymphonyElixir.StatusDashboard do
     :enabled_override,
     :render_interval_ms_override,
     :render_fun,
+    :snapshot_fun,
+    :settings_fun,
+    :max_concurrent_agents,
+    :project_link_lines,
     :token_samples,
     :last_tps_second,
     :last_tps_value,
@@ -53,7 +57,8 @@ defmodule SymphonyElixir.StatusDashboard do
     :last_rendered_at_ms,
     :pending_content,
     :flush_timer_ref,
-    :last_snapshot_fingerprint
+    :last_snapshot_fingerprint,
+    :last_successful_snapshot
   ]
 
   @type t :: %__MODULE__{
@@ -64,6 +69,10 @@ defmodule SymphonyElixir.StatusDashboard do
           enabled_override: boolean() | nil,
           render_interval_ms_override: pos_integer() | nil,
           render_fun: (String.t() -> term()),
+          snapshot_fun: (-> {:ok, map()} | :error),
+          settings_fun: (-> {:ok, map()} | :error),
+          max_concurrent_agents: pos_integer(),
+          project_link_lines: [String.t()],
           token_samples: [{integer(), integer()}],
           last_tps_second: integer() | nil,
           last_tps_value: float() | nil,
@@ -71,7 +80,8 @@ defmodule SymphonyElixir.StatusDashboard do
           last_rendered_at_ms: integer() | nil,
           pending_content: String.t() | nil,
           flush_timer_ref: reference() | nil,
-          last_snapshot_fingerprint: term() | nil
+          last_snapshot_fingerprint: term() | nil,
+          last_successful_snapshot: map() | nil
         }
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -99,10 +109,13 @@ defmodule SymphonyElixir.StatusDashboard do
     refresh_ms_override = keyword_override(opts, :refresh_ms)
     enabled_override = keyword_override(opts, :enabled)
     render_interval_ms_override = keyword_override(opts, :render_interval_ms)
-    observability = Config.settings!().observability
+    settings = Config.settings!()
+    observability = settings.observability
     refresh_ms = refresh_ms_override || observability.refresh_ms
     render_interval_ms = render_interval_ms_override || observability.render_interval_ms
     render_fun = Keyword.get(opts, :render_fun, &render_to_terminal/1)
+    snapshot_fun = Keyword.get(opts, :snapshot_fun, &snapshot_payload/0)
+    settings_fun = Keyword.get(opts, :settings_fun, &Config.settings/0)
     enabled = resolve_override(enabled_override, observability.dashboard_enabled and dashboard_enabled?())
     schedule_tick(refresh_ms, enabled)
 
@@ -115,6 +128,10 @@ defmodule SymphonyElixir.StatusDashboard do
        enabled_override: enabled_override,
        render_interval_ms_override: render_interval_ms_override,
        render_fun: render_fun,
+       snapshot_fun: snapshot_fun,
+       settings_fun: settings_fun,
+       max_concurrent_agents: settings.agent.max_concurrent_agents,
+       project_link_lines: format_project_link_lines(settings),
        token_samples: [],
        last_tps_second: nil,
        last_tps_value: nil,
@@ -122,7 +139,8 @@ defmodule SymphonyElixir.StatusDashboard do
        last_rendered_at_ms: nil,
        pending_content: nil,
        flush_timer_ref: nil,
-       last_snapshot_fingerprint: nil
+       last_snapshot_fingerprint: nil,
+       last_successful_snapshot: nil
      }}
   end
 
@@ -177,14 +195,28 @@ defmodule SymphonyElixir.StatusDashboard do
   def handle_info(:tick, state), do: {:noreply, state}
 
   defp refresh_runtime_config(%__MODULE__{} = state) do
-    observability = Config.settings!().observability
+    case safe_runtime_settings(state.settings_fun) do
+      {:ok, settings} ->
+        observability = settings.observability
 
-    %{
-      state
-      | enabled: resolve_override(state.enabled_override, observability.dashboard_enabled and dashboard_enabled?()),
-        refresh_ms: state.refresh_ms_override || observability.refresh_ms,
-        render_interval_ms: state.render_interval_ms_override || observability.render_interval_ms
-    }
+        %{
+          state
+          | enabled: resolve_override(state.enabled_override, observability.dashboard_enabled and dashboard_enabled?()),
+            refresh_ms: state.refresh_ms_override || observability.refresh_ms,
+            render_interval_ms: state.render_interval_ms_override || observability.render_interval_ms,
+            max_concurrent_agents: settings.agent.max_concurrent_agents,
+            project_link_lines: format_project_link_lines(settings)
+        }
+
+      :error ->
+        state
+    end
+  end
+
+  defp safe_runtime_settings(settings_fun \\ &Config.settings/0) do
+    settings_fun.()
+  catch
+    :exit, _reason -> :error
   end
 
   defp schedule_tick(refresh_ms, true), do: Process.send_after(self(), :tick, refresh_ms)
@@ -192,8 +224,21 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp maybe_render(state) do
     now_ms = System.monotonic_time(:millisecond)
-    {snapshot_data, token_samples} = snapshot_with_samples(state.token_samples, now_ms)
-    state = Map.put(state, :token_samples, token_samples)
+
+    {snapshot_data, token_samples, last_successful_snapshot} =
+      snapshot_with_samples(
+        state.snapshot_fun.(),
+        state.token_samples,
+        now_ms,
+        state.last_successful_snapshot,
+        state.max_concurrent_agents,
+        state.project_link_lines
+      )
+
+    state =
+      state
+      |> Map.put(:token_samples, token_samples)
+      |> Map.put(:last_successful_snapshot, last_successful_snapshot)
 
     current_tokens = snapshot_total_tokens(snapshot_data)
 
@@ -305,50 +350,87 @@ defmodule SymphonyElixir.StatusDashboard do
       %{state | pending_content: nil, flush_timer_ref: nil}
   end
 
-  defp snapshot_with_samples(token_samples, now_ms) do
-    case snapshot_payload() do
+  defp snapshot_with_samples(
+         snapshot_result,
+         token_samples,
+         now_ms,
+         last_successful_snapshot,
+         max_concurrent_agents,
+         project_link_lines
+       ) do
+    case snapshot_result do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         total_tokens = Map.get(codex_totals, :total_tokens, 0)
 
+        successful_snapshot = %{
+          running: running,
+          retrying: retrying,
+          codex_totals: codex_totals,
+          rate_limits: Map.get(snapshot, :rate_limits),
+          polling: Map.get(snapshot, :polling),
+          max_concurrent_agents: max_concurrent_agents,
+          project_link_lines: project_link_lines
+        }
+
         {
-          {:ok,
-           %{
-             running: running,
-             retrying: retrying,
-             codex_totals: codex_totals,
-             rate_limits: Map.get(snapshot, :rate_limits),
-             polling: Map.get(snapshot, :polling)
-           }},
-          update_token_samples(token_samples, now_ms, total_tokens)
+          {:ok, successful_snapshot},
+          update_token_samples(token_samples, now_ms, total_tokens),
+          successful_snapshot
+        }
+
+      :error when is_map(last_successful_snapshot) ->
+        {
+          {:stale, last_successful_snapshot},
+          prune_samples(token_samples, now_ms),
+          last_successful_snapshot
         }
 
       :error ->
         {
           :error,
-          prune_samples(token_samples, now_ms)
+          prune_samples(token_samples, now_ms),
+          nil
         }
     end
   end
 
-  defp format_snapshot_content(snapshot_data, tps, terminal_columns_override \\ nil) do
+  defp format_snapshot_content(snapshot_data, tps, terminal_columns_override \\ nil)
+
+  defp format_snapshot_content({:stale, snapshot}, tps, terminal_columns_override) do
+    format_snapshot_content(
+      {:ok, Map.put(snapshot, :snapshot_stale?, true)},
+      tps,
+      terminal_columns_override
+    )
+  end
+
+  defp format_snapshot_content(snapshot_data, tps, terminal_columns_override) do
     case snapshot_data do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
-        project_link_lines = format_project_link_lines()
+        project_link_lines = Map.get(snapshot, :project_link_lines) || format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
         codex_output_tokens = Map.get(codex_totals, :output_tokens, 0)
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
         agent_count = length(running)
-        max_agents = Config.settings!().agent.max_concurrent_agents
+        max_agents = Map.get(snapshot, :max_concurrent_agents) || configured_max_agents()
         running_event_width = running_event_width(terminal_columns_override)
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
 
+        stale_snapshot_line =
+          if Map.get(snapshot, :snapshot_stale?, false) do
+            [colorize("│ Status: last successful snapshot (refresh unavailable)", @ansi_orange)]
+          else
+            []
+          end
+
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
+           stale_snapshot_line,
            colorize("│ Agents: ", @ansi_bold) <>
              colorize("#{agent_count}", @ansi_green) <>
              colorize("/", @ansi_gray) <>
@@ -392,9 +474,23 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
+  defp configured_max_agents do
+    case safe_runtime_settings() do
+      {:ok, settings} -> settings.agent.max_concurrent_agents
+      :error -> 1
+    end
+  end
+
   defp format_project_link_lines do
+    case safe_runtime_settings() do
+      {:ok, settings} -> format_project_link_lines(settings)
+      :error -> [colorize("│ Project: ", @ansi_bold) <> colorize("n/a", @ansi_gray)]
+    end
+  end
+
+  defp format_project_link_lines(settings) do
     project_part =
-      case Config.settings!().tracker do
+      case settings.tracker do
         %{kind: "linear", project_slug: project_slug}
         when is_binary(project_slug) and project_slug != "" ->
           colorize(linear_project_url(project_slug), @ansi_cyan)
@@ -405,7 +501,7 @@ defmodule SymphonyElixir.StatusDashboard do
 
     project_line = colorize("│ Project: ", @ansi_bold) <> project_part
 
-    case dashboard_url() do
+    case dashboard_url(settings) do
       url when is_binary(url) ->
         [project_line, colorize("│ Dashboard: ", @ansi_bold) <> colorize(url, @ansi_cyan)]
 
@@ -430,8 +526,15 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
 
-  defp dashboard_url do
-    dashboard_url(Config.settings!().server.host, Config.server_port(), HttpServer.bound_port())
+  defp dashboard_url(settings) do
+    dashboard_url(settings.server.host, configured_server_port(settings), HttpServer.bound_port())
+  end
+
+  defp configured_server_port(settings) do
+    case Application.get_env(:symphony_elixir, :server_port_override) do
+      port when is_integer(port) and port >= 0 -> port
+      _ -> settings.server.port
+    end
   end
 
   defp dashboard_url(_host, nil, _bound_port), do: nil
@@ -1047,6 +1150,10 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp snapshot_total_tokens({:ok, %{codex_totals: codex_totals}}) when is_map(codex_totals) do
+    Map.get(codex_totals, :total_tokens, 0)
+  end
+
+  defp snapshot_total_tokens({:stale, %{codex_totals: codex_totals}}) when is_map(codex_totals) do
     Map.get(codex_totals, :total_tokens, 0)
   end
 
