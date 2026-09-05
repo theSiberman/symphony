@@ -220,6 +220,7 @@ defmodule SymphonyElixir.Asana.Client do
         assignee_id: get_in(task, ["assignee", "gid"]),
         labels: extract_labels(task["tags"]),
         blocked_by: [],
+        priority_inheritable: task["completed"] == false and task["resource_subtype"] != "section",
         dispatchable: task["completed"] == false and task["resource_subtype"] != "section",
         created_at: parse_datetime(task["created_at"]),
         updated_at: parse_datetime(task["modified_at"])

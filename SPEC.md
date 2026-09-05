@@ -193,6 +193,9 @@ Fields:
   - REQUIRED adapter-derived eligibility for provider-specific rules that the generic scheduler
     cannot infer safely, such as assignment, board membership, or blocker semantics.
   - The orchestrator still applies configured state, label, claim, retry, and concurrency rules.
+- `priority_inheritable` (boolean, default true)
+  - False when adapter scope/routing excludes an issue independently of its blockers.
+  - Dependency-blocked issues remain eligible to contribute priority.
 - `created_at` (timestamp or null)
 - `updated_at` (timestamp or null)
 
@@ -772,11 +775,22 @@ For refresh and continuation checks, `issue_routable(issue)` means only that ada
 `dispatchable` is true and all `tracker.required_labels` match. State, claims, and concurrency are
 checked separately by the surrounding algorithm.
 
-Sorting order (stable intent):
+Original sorting rank (stable intent):
 
 1. `priority` ascending for values `1..4`; all other integers and null sort after that bucket
 2. `created_at` oldest first; null sorts last
 3. `identifier` lexicographic tie-breaker
+
+At each poll, an active, required-labelled issue with `priority_inheritable=true`
+propagates its original rank to its open blockers transitively. Each issue sorts by
+the best rank reaching it, then its own original rank for deterministic ties. Only
+issues present in the candidate snapshot participate: missing dependencies are not
+automatically fetched or admitted. Terminal edges/targets, paused issues and adapter-excluded
+issues do not relay rank. Resolve a blocker by identifier when supplied, otherwise
+by canonical dispatch ID; provider database IDs must not collide with issue numbers.
+Cycles terminate without making any blocked issue dispatchable. Recompute from the
+current graph on every poll; preserve all eligibility, claim and concurrency checks
+and do not preempt running workers.
 
 ### 8.3 Concurrency Control
 
@@ -2125,7 +2139,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
-- Dispatch sort order is priority then oldest creation time
+- Dispatch sort order inherits the best priority/creation rank through open dependencies
 - `dispatchable=false` issues are not eligible
 - Required-label filtering is case-insensitive and applies after adapter normalization
 - Active-state issue refresh updates running entry state

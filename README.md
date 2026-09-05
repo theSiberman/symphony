@@ -10,6 +10,11 @@ _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), S
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 
+The dispatch queue defaults to priority, then oldest first. A newer blocker inherits
+the best queue position of the active tickets waiting on it, including through
+dependency chains. Ranking is recalculated each poll without interrupting running
+workers or admitting paused, excluded or still-blocked tickets.
+
 ## Running Symphony
 
 ### Requirements

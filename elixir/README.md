@@ -7,6 +7,11 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 > Symphony Elixir is prototype software intended for evaluation only and is presented as-is.
 > We recommend implementing your own hardened version based on `SPEC.md`.
 
+The dispatch queue defaults to priority, then oldest first. A newer blocker inherits
+the best queue position of the active tickets waiting on it, including through
+dependency chains. Ranking is recalculated each poll without interrupting running
+workers or admitting paused, excluded or still-blocked tickets.
+
 ## Screenshot
 
 ![Symphony Elixir screenshot](../.github/media/elixir-screenshot.png)

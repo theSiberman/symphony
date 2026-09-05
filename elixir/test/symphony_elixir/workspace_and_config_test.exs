@@ -535,6 +535,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     issue = Client.normalize_issue_for_test(raw_issue, "user-1")
 
+    refute issue.priority_inheritable
     refute issue.dispatchable
   end
 

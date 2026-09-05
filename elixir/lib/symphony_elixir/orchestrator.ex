@@ -796,14 +796,75 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
-    Enum.sort_by(issues, fn
-      %Issue{} = issue ->
-        {priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
+    queued = Enum.filter(issues, &priority_donor?/1)
+    by_id = Map.new(queued, &{&1.id, &1})
+    by_identifier = Map.new(queued, &{&1.identifier, &1.id})
+    terminal_states = terminal_state_set()
 
-      _ ->
-        {priority_rank(nil), issue_created_at_sort_key(nil), ""}
+    edges =
+      Map.new(queued, fn issue ->
+        {issue.id, dispatch_blockers(issue, by_id, by_identifier, terminal_states)}
+      end)
+
+    ranks =
+      Enum.reduce(queued, %{}, fn issue, ranks ->
+        inherit_dispatch_rank([issue.id], dispatch_rank(issue), edges, %{}, ranks)
+      end)
+
+    Enum.sort_by(issues, fn issue ->
+      original = dispatch_rank(issue)
+      id = if is_struct(issue, Issue), do: issue.id
+      {Map.get(ranks, id, original), original}
     end)
   end
+
+  defp dispatch_blockers(issue, by_id, by_identifier, terminal_states) do
+    Enum.flat_map(issue.blocked_by, fn blocker ->
+      identifier = blocker[:identifier] || blocker["identifier"]
+      id = blocker[:id] || blocker["id"]
+      state = blocker[:state] || blocker["state"]
+      target = if is_binary(identifier), do: by_identifier[identifier], else: id
+
+      if Map.has_key?(by_id, target) and
+           not (is_binary(state) and terminal_issue_state?(state, terminal_states)) do
+        [target]
+      else
+        []
+      end
+    end)
+  end
+
+  defp priority_donor?(%Issue{id: id, state: state, priority_inheritable: true} = issue)
+       when is_binary(id) and is_binary(state) do
+    active_issue_state?(state, active_state_set()) and
+      not terminal_issue_state?(state, terminal_state_set()) and
+      Issue.routable?(%{issue | dispatchable: true}, Config.settings!().tracker.required_labels)
+  end
+
+  defp priority_donor?(_issue), do: false
+
+  @spec inherit_dispatch_rank([String.t()], tuple(), map(), map(), map()) :: map()
+  defp inherit_dispatch_rank([], _rank, _edges, _visited, ranks), do: ranks
+
+  defp inherit_dispatch_rank([id | rest], rank, edges, visited, ranks) do
+    if Map.has_key?(visited, id) do
+      inherit_dispatch_rank(rest, rank, edges, visited, ranks)
+    else
+      inherit_dispatch_rank(
+        Map.get(edges, id, []) ++ rest,
+        rank,
+        edges,
+        Map.put(visited, id, true),
+        Map.update(ranks, id, rank, &min(&1, rank))
+      )
+    end
+  end
+
+  defp dispatch_rank(%Issue{} = issue) do
+    {priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
+  end
+
+  defp dispatch_rank(_issue), do: {priority_rank(nil), issue_created_at_sort_key(nil), ""}
 
   defp priority_rank(priority) when is_integer(priority) and priority in 1..4, do: priority
   defp priority_rank(_priority), do: 5

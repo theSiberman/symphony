@@ -236,13 +236,13 @@ defmodule SymphonyElixir.GitHub.Client do
       end)
 
     enriched = %{issue | native_ref: native_ref, blocked_by: normalized_blockers}
+    priority_inheritable = enriched.dispatchable and dispatch_candidate?(enriched, settings)
 
     {:ok,
      %{
        enriched
-       | dispatchable:
-           enriched.dispatchable and normalized_blockers == [] and
-             dispatch_candidate?(enriched, settings)
+       | priority_inheritable: priority_inheritable,
+         dispatchable: priority_inheritable and normalized_blockers == []
      }}
   end
 

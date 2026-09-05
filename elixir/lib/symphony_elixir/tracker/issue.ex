@@ -23,6 +23,7 @@ defmodule SymphonyElixir.Tracker.Issue do
     blocked_by: [],
     labels: [],
     dispatchable: false,
+    priority_inheritable: true,
     created_at: nil,
     updated_at: nil
   ]
@@ -41,6 +42,7 @@ defmodule SymphonyElixir.Tracker.Issue do
           labels: [String.t()],
           blocked_by: [map()],
           dispatchable: boolean(),
+          priority_inheritable: boolean(),
           created_at: DateTime.t() | nil,
           updated_at: DateTime.t() | nil
         }
