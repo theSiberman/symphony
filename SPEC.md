@@ -2328,3 +2328,22 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+### Optional scheduler-owned running audit labels
+
+An adapter MAY provide an opt-in audit-label reconciliation callback. The configured label
+MUST be exclusively owned by one scheduler within its documented scope, and MUST NOT also
+control required-label eligibility or label-based workflow states. GitHub's
+`tracker.provider.managed_running_label` applies repository-wide, including closed issues,
+independently of dispatch filters. Other labels and PRs remain untouched.
+
+The scheduler reconciles from its running map before startup admission, after worker exit or
+termination, after admission, and on subsequent polls (including failed candidate reads).
+Retry claims and blocked issues are not running workers. Reconciliation is serialized with
+admission; enumeration completes before mutation. API failures retain retryable work for the
+next poll and do not fail agent tasks. Forced shutdown cleanup occurs on the next startup,
+after the runtime supervisor has stopped the prior worker tasks.
+
+Mutation scope is bound at startup. Changing repository, API endpoint, or managed label
+requires a restart and prevents new admissions until then; writes retain the original scope.
+Before changing ownership scope, operators must reconcile the old scope while idle.

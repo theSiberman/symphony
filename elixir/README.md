@@ -259,6 +259,18 @@ codex:
   `tracker.provider.state_source: labels` to use labels as workflow states instead; then list the
   active and terminal label names in `active_states` and `terminal_states`. Comparisons ignore case,
   while the provider's original label spelling is retained on the normalized issue.
+- Running audit label: opt in with `tracker.provider.managed_running_label: in-progress`.
+  This grants this scheduler exclusive ownership of that label across the entire repository,
+  including closed issues and issues outside a spec filter. Use a separate label for other
+  schedulers or human work. It must differ from required labels and label-based workflow states.
+  Symphony removes stale markers before startup admission, after worker exit/termination, and
+  on every poll; it adds missing markers for running workers. Backoff and blocked claims do not
+  count as running. API failures are logged and retried on the next poll without failing workers.
+  A forced process shutdown is repaired on the next startup. Repository, API endpoint, or managed
+  label changes require a scheduler restart: existing label writes retain their original scope,
+  and admissions stop until restart. Keep the old ownership setting through a final idle
+  reconciliation before changing it, so labels in the old scope are removed. Token environment
+  references remain resolved at request time. Agents should leave this audit label to Symphony.
 - Frontier and scope: label-state polling follows all pages of GitHub's native `blocked_by`
   relationship. An issue with any open blocker remains visible but is non-dispatchable; it becomes
   eligible on the first poll after its final blocker closes. Dispatch is revalidated immediately

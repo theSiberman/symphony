@@ -12,6 +12,13 @@ defmodule SymphonyElixir.GitHub.Client do
   @page_size 100
   @user_agent "symphony"
 
+  @doc "Resolves repository identity for scheduler-owned mutation bindings."
+  @spec repository_identity(map()) :: {String.t() | nil, String.t() | nil}
+  def repository_identity(tracker_settings) do
+    provider = provider_settings(tracker_settings)
+    {provider["api_url"] || @default_api_url, resolve_setting(provider["repo"], System.get_env("GITHUB_REPO"))}
+  end
+
   @spec validate_settings(map()) :: :ok | {:error, term()}
   def validate_settings(tracker_settings) do
     with {:ok, _settings} <- settings(tracker_settings), do: :ok

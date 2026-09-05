@@ -33,6 +33,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :running_labels,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -66,6 +67,7 @@ defmodule SymphonyElixir.Orchestrator do
           poll_check_in_progress: false,
           tick_timer_ref: nil,
           tick_token: nil,
+          running_labels: Tracker.bind_running_labels(config.tracker),
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
@@ -141,6 +143,7 @@ defmodule SymphonyElixir.Orchestrator do
         session_id = running_entry_session_id(running_entry)
 
         state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
+        state = reconcile_running_labels(state)
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -255,13 +258,35 @@ defmodule SymphonyElixir.Orchestrator do
     })
   end
 
+  defp validate_label_ownership(state) do
+    if Tracker.running_labels_compatible?(state.running_labels, Config.settings!().tracker) do
+      :ok
+    else
+      {:error, :running_label_ownership_changed_restart_required}
+    end
+  end
+
+  defp reconcile_running_labels(state) do
+    case Tracker.reconcile_running_labels(state.running_labels, Map.keys(state.running)) do
+      :ok -> :ok
+      {:error, reason} -> Logger.warning("Running-label reconciliation failed; retrying next poll: #{inspect(reason)}")
+    end
+
+    state
+  end
+
   defp maybe_dispatch(%State{} = state) do
     state =
-      state
-      |> reconcile_running_issues()
-      |> reconcile_blocked_issues()
+      if validate_label_ownership(state) == :ok do
+        state |> reconcile_running_issues() |> reconcile_blocked_issues()
+      else
+        state
+      end
 
-    with :ok <- Config.validate!(),
+    state = reconcile_running_labels(state)
+
+    with :ok <- validate_label_ownership(state),
+         :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
          true <- available_slots(state) > 0 do
       choose_issues(issues, state)
@@ -574,6 +599,7 @@ defmodule SymphonyElixir.Orchestrator do
             blocked: Map.delete(state.blocked, issue_id),
             retry_attempts: Map.delete(state.retry_attempts, issue_id)
         }
+        |> reconcile_running_labels()
 
       _ ->
         release_issue_claim(state, issue_id)
@@ -968,7 +994,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
-    case refresh_issue_for_dispatch(issue) do
+    case with(:ok <- validate_label_ownership(state), do: refresh_issue_for_dispatch(issue)) do
       {:ok, %Issue{} = refreshed_issue} ->
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
 
@@ -1052,6 +1078,7 @@ defmodule SymphonyElixir.Orchestrator do
             claimed: MapSet.put(state.claimed, issue.id),
             retry_attempts: Map.delete(state.retry_attempts, issue.id)
         }
+        |> reconcile_running_labels()
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")

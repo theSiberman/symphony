@@ -5,7 +5,7 @@ defmodule SymphonyElixir.GitHub.Adapter do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.GitHub.{AgentTool, Client}
+  alias SymphonyElixir.GitHub.{AgentTool, Client, RunningLabels}
   alias SymphonyElixir.Tracker.Issue
 
   @active_states ["open"]
@@ -14,7 +14,8 @@ defmodule SymphonyElixir.GitHub.Adapter do
   @spec validate_config(map()) :: :ok | {:error, term()}
   def validate_config(tracker_settings) do
     with :ok <- validate_active_states(tracker_settings),
-         :ok <- validate_terminal_states(tracker_settings) do
+         :ok <- validate_terminal_states(tracker_settings),
+         :ok <- RunningLabels.validate_config(tracker_settings) do
       Client.validate_settings(tracker_settings)
     end
   end
@@ -24,6 +25,15 @@ defmodule SymphonyElixir.GitHub.Adapter do
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids), do: client_module().fetch_issues_by_ids(issue_ids)
+
+  @spec bind_running_labels(map()) :: map() | nil
+  def bind_running_labels(settings), do: RunningLabels.bind(settings)
+
+  @spec reconcile_running_labels(map(), [String.t()]) :: :ok | {:error, term()}
+  def reconcile_running_labels(settings, ids) do
+    client = client_module()
+    RunningLabels.reconcile(settings, ids, &client.request/5)
+  end
 
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs, do: AgentTool.tool_specs()

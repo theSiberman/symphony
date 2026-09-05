@@ -2,9 +2,8 @@ defmodule SymphonyElixir.Tracker do
   @moduledoc """
   Adapter boundary for issue tracker reads and provider-native agent tools.
 
-  The orchestrator only depends on the read callbacks. Agent-side mutations stay
-  behind optional provider-native tools so tracker-specific capabilities do not
-  leak into scheduler policy.
+  Scheduler-owned audit labels use an optional reconciliation callback. Other
+  mutations stay behind provider-native agent tools.
   """
 
   alias SymphonyElixir.Config
@@ -26,7 +25,12 @@ defmodule SymphonyElixir.Tracker do
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
 
-  @optional_callbacks agent_tool_specs: 0,
+  @callback bind_running_labels(map()) :: map() | nil
+  @callback reconcile_running_labels(map(), [String.t()]) :: :ok | {:error, term()}
+
+  @optional_callbacks bind_running_labels: 1,
+                      reconcile_running_labels: 2,
+                      agent_tool_specs: 0,
                       execute_agent_tool: 3,
                       validate_config: 1
 
@@ -39,6 +43,34 @@ defmodule SymphonyElixir.Tracker do
   def fetch_issues_by_ids(issue_ids) do
     adapter().fetch_issues_by_ids(issue_ids)
   end
+
+  @doc "Binds optional audit-label ownership to a scheduler lifetime."
+  @spec bind_running_labels(map()) :: map() | nil
+  def bind_running_labels(settings) do
+    with {:ok, adapter} <- adapter_for_kind(settings.kind),
+         true <- Code.ensure_loaded?(adapter) and function_exported?(adapter, :bind_running_labels, 1),
+         binding when is_map(binding) <- adapter.bind_running_labels(settings) do
+      Map.put(binding, :adapter, adapter)
+    else
+      _ -> nil
+    end
+  end
+
+  @spec running_labels_compatible?(map() | nil, map()) :: boolean()
+  def running_labels_compatible?(binding, settings) do
+    current = bind_running_labels(settings)
+    label_identity(binding) == label_identity(current)
+  end
+
+  @spec reconcile_running_labels(map() | nil, [String.t()]) :: :ok | {:error, term()}
+  def reconcile_running_labels(nil, _ids), do: :ok
+
+  def reconcile_running_labels(%{adapter: adapter, tracker_settings: settings}, ids) do
+    adapter.reconcile_running_labels(settings, ids)
+  end
+
+  defp label_identity(nil), do: nil
+  defp label_identity(binding), do: {binding.adapter, binding.scope}
 
   @doc """
   Captures the selected adapter and effective tracker settings for one

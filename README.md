@@ -41,6 +41,11 @@ help with the setup:
 
 ---
 
+GitHub deployments can opt into scheduler-owned running audit labels. Symphony reconciles
+these labels with live workers on startup, worker exit, and subsequent polls, so paused,
+failed, and completed tickets do not depend on an agent's final cleanup instruction.
+See the [GitHub adapter configuration](elixir/README.md#github-issues-adapter) for ownership scope.
+
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
