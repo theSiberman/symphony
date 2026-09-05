@@ -30,6 +30,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       title: "Snapshot test",
       description: "Capture codex state",
       state: "In Progress",
+      native_ref: %{"parent_number" => 225},
       url: "https://example.org/issues/MT-188"
     }
 
@@ -91,6 +92,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert %{running: [snapshot_entry]} = snapshot
     assert snapshot_entry.issue_id == issue_id
     assert snapshot_entry.issue_url == "https://example.org/issues/MT-188"
+
+    assert snapshot_entry.integration_target == %{
+             kind: :parent_spec,
+             branch: "spec/225-*",
+             parent_number: 225
+           }
+
     assert snapshot_entry.session_id == "thread-live-turn-live"
     assert snapshot_entry.turn_count == 1
     assert snapshot_entry.last_codex_timestamp == now

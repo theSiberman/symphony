@@ -18,6 +18,23 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     Snapshot.assert_dashboard_snapshot!("idle", render_snapshot(snapshot_data, 0.0))
   end
 
+  test "running child issue exposes its integration target" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [
+           running_entry(%{
+             identifier: "GH-241",
+             integration_target: %{kind: :parent_spec, branch: "spec/225-*"}
+           })
+         ],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+       }}
+
+    assert render_snapshot(snapshot_data, 0.0) =~ "target=spec/225-*"
+  end
+
   test "snapshot fixture: idle dashboard with observability url" do
     previous_port_override = Application.get_env(:symphony_elixir, :server_port_override)
 

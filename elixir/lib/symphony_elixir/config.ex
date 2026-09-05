@@ -59,7 +59,7 @@ defmodule SymphonyElixir.Config do
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do
       {:ok, policy} ->
-        policy
+        authorize_git_metadata(policy, workspace)
 
       {:error, reason} ->
         raise ArgumentError, message: "Invalid codex turn sandbox policy: #{inspect(reason)}"
@@ -107,11 +107,63 @@ defmodule SymphonyElixir.Config do
          %{
            approval_policy: settings.codex.approval_policy,
            thread_sandbox: settings.codex.thread_sandbox,
-           turn_sandbox_policy: turn_sandbox_policy
+           turn_sandbox_policy: authorize_git_metadata(turn_sandbox_policy, workspace)
          }}
       end
     end
   end
+
+  @doc false
+  @spec authorize_git_metadata(map(), Path.t() | nil) :: map()
+  def authorize_git_metadata(
+        %{"type" => "workspaceWrite", "writableRoots" => writable_roots} = policy,
+        workspace
+      )
+      when is_list(writable_roots) and is_binary(workspace) do
+    with {:ok, git_dir} <- resolve_git_dir(workspace),
+         true <- Enum.any?(writable_roots, &contains_path?(&1, git_dir)) do
+      Map.put(policy, "writableRoots", Enum.uniq(writable_roots ++ [git_dir]))
+    else
+      _ -> policy
+    end
+  end
+
+  def authorize_git_metadata(policy, _workspace), do: policy
+
+  defp resolve_git_dir(workspace) do
+    dot_git = Path.join(workspace, ".git")
+
+    cond do
+      File.dir?(dot_git) ->
+        SymphonyElixir.PathSafety.canonicalize(dot_git)
+
+      File.regular?(dot_git) ->
+        with {:ok, contents} <- File.read(dot_git),
+             [_, path] <- Regex.run(~r/^gitdir:\s*(.+?)\s*$/m, contents) do
+          path
+          |> Path.expand(workspace)
+          |> SymphonyElixir.PathSafety.canonicalize()
+        else
+          _ -> {:error, :invalid_git_file}
+        end
+
+      true ->
+        {:error, :missing_git_dir}
+    end
+  end
+
+  defp contains_path?(root, path) when is_binary(root) do
+    case SymphonyElixir.PathSafety.canonicalize(Path.expand(root)) do
+      {:ok, canonical_root} ->
+        relative = Path.relative_to(path, canonical_root)
+        relative == "." or (relative != ".." and not String.starts_with?(relative, "../"))
+
+      _ ->
+        false
+    end
+  end
+
+  defp contains_path?(_root, _path), do: false
 
   @doc false
   @spec validate_settings(Schema.t()) :: :ok | {:error, term()}
