@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, IntegrationTarget, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -577,24 +577,24 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
-    %{
-      issue_id: issue_id,
-      issue_identifier: identifier || "issue"
-    }
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
+    build_issue_context(issue_id, identifier, IntegrationTarget.for_issue(issue))
   end
 
   defp issue_context(identifier) when is_binary(identifier) do
-    %{
-      issue_id: nil,
-      issue_identifier: identifier
-    }
+    build_issue_context(nil, identifier, IntegrationTarget.for_issue(nil))
   end
 
   defp issue_context(_identifier) do
+    build_issue_context(nil, "issue", IntegrationTarget.for_issue(nil))
+  end
+
+  defp build_issue_context(issue_id, issue_identifier, integration_target) do
     %{
-      issue_id: nil,
-      issue_identifier: "issue"
+      issue_id: issue_id,
+      issue_identifier: issue_identifier || "issue",
+      issue_parent_number: integration_target.parent_number,
+      integration_branch: integration_target.branch
     }
   end
 
@@ -602,10 +602,17 @@ defmodule SymphonyElixir.Workspace do
     "issue_id=#{issue_id || "n/a"} issue_identifier=#{issue_identifier || "issue"}"
   end
 
-  defp hook_environment(%{issue_id: issue_id, issue_identifier: issue_identifier}) do
+  defp hook_environment(issue_context) when is_map(issue_context) do
+    issue_id = Map.get(issue_context, :issue_id)
+    issue_identifier = Map.get(issue_context, :issue_identifier)
+    parent_number = Map.get(issue_context, :issue_parent_number)
+    integration_branch = Map.get(issue_context, :integration_branch, "main")
+
     [
       {"SYMPHONY_ISSUE_ID", issue_id || ""},
-      {"SYMPHONY_ISSUE_IDENTIFIER", issue_identifier || "issue"}
+      {"SYMPHONY_ISSUE_IDENTIFIER", issue_identifier || "issue"},
+      {"SYMPHONY_ISSUE_PARENT_NUMBER", if(is_integer(parent_number), do: Integer.to_string(parent_number), else: "")},
+      {"SYMPHONY_INTEGRATION_BRANCH", integration_branch}
     ]
   end
 

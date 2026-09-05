@@ -878,7 +878,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "echo after_create > after_create.log\nprintf '%s\\t%s\\n' \"$SYMPHONY_ISSUE_ID\" \"$SYMPHONY_ISSUE_IDENTIFIER\" > hook-env.log\necho call >> \"#{after_create_counter}\"",
+        hook_after_create:
+          "echo after_create > after_create.log\nprintf '%s\\t%s\\t%s\\t%s\\n' \"$SYMPHONY_ISSUE_ID\" \"$SYMPHONY_ISSUE_IDENTIFIER\" \"$SYMPHONY_ISSUE_PARENT_NUMBER\" \"$SYMPHONY_INTEGRATION_BRANCH\" > hook-env.log\necho call >> \"#{after_create_counter}\"",
         hook_before_remove: "echo before_remove > \"#{before_remove_marker}\""
       )
 
@@ -886,10 +887,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert config.hooks.after_create =~ "echo after_create > after_create.log"
       assert config.hooks.before_remove =~ "echo before_remove >"
 
-      issue = %Issue{id: "42", identifier: "MT-HOOKS"}
+      issue = %Issue{
+        id: "42",
+        identifier: "MT-HOOKS",
+        native_ref: %{"parent_number" => 225}
+      }
+
       assert {:ok, workspace} = Workspace.create_for_issue(issue)
       assert File.read!(Path.join(workspace, "after_create.log")) == "after_create\n"
-      assert File.read!(Path.join(workspace, "hook-env.log")) == "42\tMT-HOOKS\n"
+
+      assert File.read!(Path.join(workspace, "hook-env.log")) ==
+               "42\tMT-HOOKS\t225\tspec/225-*\n"
 
       assert {:ok, _workspace} = Workspace.create_for_issue(issue)
       assert length(String.split(String.trim(File.read!(after_create_counter)), "\n")) == 1
@@ -1598,6 +1606,36 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
     assert Config.workflow_prompt() == workflow_prompt
+  end
+
+  test "runtime sandbox policy authorizes the exact external git directory" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-git-policy-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace = Path.join(test_root, "workspaces/GH-123")
+      metadata_root = Path.join(test_root, "git-metadata")
+      git_dir = Path.join(metadata_root, "GH-123")
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(git_dir)
+      File.write!(Path.join(workspace, ".git"), "gitdir: #{git_dir}\n")
+
+      policy = %{
+        "type" => "workspaceWrite",
+        "writableRoots" => [workspace, metadata_root],
+        "networkAccess" => true
+      }
+
+      assert Config.authorize_git_metadata(policy, workspace) == %{
+               policy
+               | "writableRoots" => [workspace, metadata_root, git_dir]
+             }
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "remote workspace lifecycle uses ssh host aliases from worker config" do

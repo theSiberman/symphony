@@ -686,9 +686,16 @@ defmodule SymphonyElixir.StatusDashboard do
     else
       running
       |> Enum.sort_by(& &1.identifier)
-      |> Enum.map(&format_running_summary(&1, running_event_width))
+      |> Enum.flat_map(fn entry ->
+        [format_running_summary(entry, running_event_width)] ++ format_integration_target(entry)
+      end)
     end
   end
+
+  defp format_integration_target(%{integration_target: %{branch: branch}}) when is_binary(branch),
+    do: ["│    " <> colorize("target=#{branch}", @ansi_gray)]
+
+  defp format_integration_target(_entry), do: []
 
   # credo:disable-for-next-line
   defp format_running_summary(running_entry, running_event_width) do
