@@ -28,6 +28,9 @@ hooks:
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
 agent:
+  # Optional host admission; requires GNU timeout on the scheduler host.
+  # admission_command: /deployment/bin/check-capacity
+  max_abnormal_retries: 3
   max_concurrent_agents: 10
   max_turns: 20
 codex:
@@ -327,3 +330,7 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 
 - <only include when something was confusing during execution>
 ````
+
+The scheduler preserves exhausted-worker holds under the workspace root until
+the tracker confirms them, replaying pending holds before dispatch after restart.
+Temporary provider or tracker errors back off without spending abnormal attempts.

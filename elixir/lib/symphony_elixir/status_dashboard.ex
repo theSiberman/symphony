@@ -367,6 +367,7 @@ defmodule SymphonyElixir.StatusDashboard do
           retrying: retrying,
           codex_totals: codex_totals,
           rate_limits: Map.get(snapshot, :rate_limits),
+          admission: Map.get(snapshot, :admission),
           polling: Map.get(snapshot, :polling),
           max_concurrent_agents: max_concurrent_agents,
           project_link_lines: project_link_lines
@@ -431,6 +432,7 @@ defmodule SymphonyElixir.StatusDashboard do
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
            stale_snapshot_line,
+           admission_line(Map.get(snapshot, :admission)),
            colorize("│ Agents: ", @ansi_bold) <>
              colorize("#{agent_count}", @ansi_green) <>
              colorize("/", @ansi_gray) <>
@@ -651,6 +653,9 @@ defmodule SymphonyElixir.StatusDashboard do
   def dashboard_url_for_test(host, configured_port, bound_port),
     do: dashboard_url(host, configured_port, bound_port)
 
+  defp admission_line(%{status: "waiting", reason: reason}), do: "│ Host waiting: #{reason}"
+  defp admission_line(_), do: []
+
   defp snapshot_payload do
     if Process.whereis(Orchestrator) do
       case Orchestrator.snapshot() do
@@ -666,6 +671,7 @@ defmodule SymphonyElixir.StatusDashboard do
              retrying: retrying,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
+             admission: Map.get(snapshot, :admission),
              polling: Map.get(snapshot, :polling)
            }}
 
