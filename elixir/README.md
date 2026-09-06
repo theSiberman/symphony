@@ -25,7 +25,9 @@ abnormal-failure count; `agent.max_abnormal_retries` defaults to three. Exhausti
 preserves work and records a pending exception under the workspace root before
 asking the tracker to hold the issue. GitHub uses `needs-info` and removes queue
 labels. Pending writes replay before dispatch, including after restart; the marker
-is removed only after the tracker confirms the hold. Unreadable markers block
+is removed only after the tracker confirms the hold. Markers carry their original
+non-secret repository identity; a scope change cannot redirect a pending hold.
+Unreadable or mismatched markers block
 admission visibly. Temporary provider and tracker errors retain the abnormal
 count and retry with a positive backoff.
 

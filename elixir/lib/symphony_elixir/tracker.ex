@@ -46,6 +46,15 @@ defmodule SymphonyElixir.Tracker do
       else: {:error, :tracker_pause_unsupported}
   end
 
+  @doc "Non-secret identity for pending holds; only GitHub and memory support holds."
+  @spec exception_scope(map()) :: map()
+  def exception_scope(%{kind: "github"} = settings) do
+    {api_url, repo} = SymphonyElixir.GitHub.Client.repository_identity(settings)
+    %{"kind" => "github", "api_url" => api_url, "repo" => repo}
+  end
+
+  def exception_scope(settings), do: %{"kind" => settings.kind}
+
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
     adapter().fetch_issues_by_states(states)

@@ -81,11 +81,63 @@ defmodule SymphonyElixir.FailureRecoveryTest do
 
   test "transient provider failure retains the abnormal count and queue membership", %{issue: issue} do
     pid = start_supervised!({Orchestrator, name: ProviderRecovery})
-    crash(pid, issue, 3, {:agent_failed, {:turn_failed, %{code: "temporarily_unavailable"}}})
+    payload = %{"threadId" => "thread", "turn" => %{"error" => %{"codexErrorInfo" => "serverOverloaded"}}}
+    crash(pid, issue, 3, {:agent_failed, {:turn_failed, payload}})
     eventually(fn -> :sys.get_state(pid).running == %{} end)
     assert %{attempt: 3} = :sys.get_state(pid).retry_attempts[issue.id]
     assert Agent.get(OfflineGitHub, & &1.issues) == [issue]
     assert {:ok, []} = Workspace.pending_exceptions()
+  end
+
+  test "a provider HTTP outage in a JSON-RPC error preserves retry eligibility", %{issue: issue} do
+    pid = start_supervised!({Orchestrator, name: ProviderHttpRecovery})
+
+    payload = %{
+      "code" => -32000,
+      "message" => "upstream unavailable",
+      "data" => %{"codexErrorInfo" => %{"httpConnectionFailed" => %{"httpStatusCode" => 503}}}
+    }
+
+    crash(pid, issue, 3, {:agent_failed, {:response_error, payload}})
+    eventually(fn -> :sys.get_state(pid).running == %{} end)
+    assert %{attempt: 3} = :sys.get_state(pid).retry_attempts[issue.id]
+    assert Agent.get(OfflineGitHub, & &1.issues) == [issue]
+  end
+
+  for {label, detail} <- [
+        {"bad request", %{"error" => %{"codexErrorInfo" => "badRequest"}}},
+        {"unauthorized", %{"data" => %{"codexErrorInfo" => "unauthorized"}}},
+        {"unknown", %{"unexpected" => "payload"}},
+        {"permanent HTTP failure", %{"codexErrorInfo" => %{"httpConnectionFailed" => %{"httpStatusCode" => 403}}}}
+      ] do
+    test "#{label} provider response exhausts the finite abnormal ceiling", %{issue: issue} do
+      pid = start_supervised!({Orchestrator, name: PermanentProviderFailure})
+      crash(pid, issue, 3, {:agent_failed, {:response_error, unquote(Macro.escape(detail))}})
+      eventually(fn -> Agent.get(OfflineGitHub, &hd(&1.issues).state) == "needs-info" end)
+      assert :sys.get_state(pid).retry_attempts == %{}
+    end
+  end
+
+  test "a pending hold never follows a repository change on reload or restart", %{root: root, issue: issue} do
+    update(%{pause_error: true})
+    pid = start_supervised!({Orchestrator, name: ScopedExceptionRecovery})
+    crash(pid, issue, 3, :boom)
+    eventually(fn -> match?({:ok, [_]}, Workspace.pending_exceptions()) end)
+    {:ok, [marker]} = Workspace.pending_exceptions()
+    assert marker["scope"] == %{"kind" => "github", "api_url" => "https://api.github.com", "repo" => "fixture/offline"}
+    refute Jason.encode!(marker) =~ "fixture-token"
+    configure(root, "true", "fixture/another")
+    update(%{pause_error: false, requests: 0})
+    send(pid, :run_poll_cycle)
+    eventually(fn -> :sys.get_state(pid).exception_error != nil end)
+    assert Agent.get(OfflineGitHub, & &1.requests) == 0
+    stop_supervised!(Orchestrator)
+    restarted = start_supervised!({Orchestrator, name: ScopedExceptionRecovery})
+    eventually(fn -> :sys.get_state(restarted).exception_error != nil end)
+    assert Agent.get(OfflineGitHub, & &1.requests) == 0
+    assert Agent.get(OfflineGitHub, & &1.issues) == [issue]
+    refute File.exists?(Path.join(root, "worker-started"))
+    assert {:ok, [^marker]} = Workspace.pending_exceptions()
   end
 
   test "failed exception persistence survives restart before a workspace exists", %{root: root, issue: issue} do
@@ -133,13 +185,13 @@ defmodule SymphonyElixir.FailureRecoveryTest do
 
   defp update(changes), do: Agent.update(OfflineGitHub, &Map.merge(&1, changes))
 
-  defp configure(root, command) do
+  defp configure(root, command, repo \\ "fixture/offline") do
     File.write!(Workflow.workflow_file_path(), """
     ---
     tracker:
       kind: github
       provider:
-        repo: fixture/offline
+        repo: #{repo}
         token: fixture-token
         state_source: labels
       required_labels: [ready-for-agent]

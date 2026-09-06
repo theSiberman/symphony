@@ -36,6 +36,7 @@ defmodule SymphonyElixir.Orchestrator do
       :running_labels,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       exception_error: nil,
+      exception_scope: nil,
       admission_task: nil,
       admission_command: nil,
       admission: :unchecked,
@@ -72,6 +73,7 @@ defmodule SymphonyElixir.Orchestrator do
           tick_timer_ref: nil,
           tick_token: nil,
           running_labels: Tracker.bind_running_labels(config.tracker),
+          exception_scope: Tracker.exception_scope(config.tracker),
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
@@ -289,19 +291,44 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp transient_failure?({:agent_failed, {kind, _detail}})
-       when kind in [:issue_state_refresh_failed, :response_error, :turn_failed], do: true
+  defp transient_failure?({:agent_failed, {:issue_state_refresh_failed, _detail}}), do: true
+
+  defp transient_failure?({:agent_failed, {kind, detail}}) when kind in [:response_error, :turn_failed],
+    do: transient_provider_error?(detail)
 
   defp transient_failure?(_reason), do: false
+
+  defp transient_provider_error?(%{"codexErrorInfo" => info}) do
+    case info do
+      code when code in ["rateLimitExceeded", "serverOverloaded", "internalServerError"] -> true
+      %{"httpConnectionFailed" => detail} -> transient_http_error?(detail)
+      %{"responseStreamConnectionFailed" => detail} -> transient_http_error?(detail)
+      %{"responseStreamDisconnected" => detail} -> transient_http_error?(detail)
+      %{"responseTooManyFailedAttempts" => detail} -> transient_http_error?(detail)
+      _ -> false
+    end
+  end
+
+  defp transient_provider_error?(%{"error" => error}), do: transient_provider_error?(error)
+  defp transient_provider_error?(%{"data" => data}), do: transient_provider_error?(data)
+  defp transient_provider_error?(%{"turn" => turn}), do: transient_provider_error?(turn)
+  defp transient_provider_error?(_detail), do: false
+
+  defp transient_http_error?(%{"httpStatusCode" => status}),
+    do: is_nil(status) or status == 429 or (is_integer(status) and status >= 500 and status <= 599)
+
+  defp transient_http_error?(_detail), do: false
 
   defp replay_pending_exceptions(state) do
     writes =
       for {_id, entry} <- state.blocked, entry[:pending_exception] != nil do
-        Workspace.record_exception(entry.issue, entry.pending_exception)
+        Workspace.record_exception(entry.issue, entry.pending_exception, state.exception_scope)
       end
 
     with nil <- Enum.find(writes, &(&1 != :ok)),
-         {:ok, pending} <- Workspace.pending_exceptions() do
+         :ok <- validate_label_ownership(state),
+         {:ok, pending} <- Workspace.pending_exceptions(),
+         :ok <- validate_exception_scope(state, pending) do
       Enum.reduce(pending, %{state | exception_error: nil}, &replay_exception/2)
     else
       error ->
@@ -309,6 +336,13 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error(reason)
         %{state | exception_error: reason}
     end
+  end
+
+  defp validate_exception_scope(state, pending) do
+    if state.exception_scope == Tracker.exception_scope(Config.settings!().tracker) and
+         Enum.all?(pending, &(&1["scope"] == state.exception_scope)),
+       do: :ok,
+       else: {:error, :pending_exception_tracker_scope_mismatch}
   end
 
   defp replay_exception(%{"id" => id, "identifier" => identifier, "reason" => reason}, state) do

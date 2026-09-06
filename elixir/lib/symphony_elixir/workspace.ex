@@ -12,14 +12,14 @@ defmodule SymphonyElixir.Workspace do
 
   # These markers exist only while an exhausted-worker hold is being written to
   # the tracker. They also cover failures before a ticket checkout exists.
-  @spec record_exception(map(), String.t()) :: :ok | {:error, term()}
-  def record_exception(issue, reason) do
+  @spec record_exception(map(), String.t(), map()) :: :ok | {:error, term()}
+  def record_exception(issue, reason, scope) do
     with {:ok, directory} <- exception_directory(),
          :ok <- File.mkdir_p(directory) do
       path = Path.join(directory, workspace_key(issue) <> ".json")
 
       with :ok <- validate_local_workspace_path(path, directory) do
-        File.write(path, Jason.encode!(%{id: issue.id, identifier: issue.identifier, reason: reason}), [:sync])
+        File.write(path, Jason.encode!(%{id: issue.id, identifier: issue.identifier, reason: reason, scope: scope}), [:sync])
       end
     end
   end
