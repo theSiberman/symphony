@@ -93,7 +93,7 @@ defmodule SymphonyElixir.FailureRecoveryTest do
     pid = start_supervised!({Orchestrator, name: ProviderHttpRecovery})
 
     payload = %{
-      "code" => -32000,
+      "code" => -32_000,
       "message" => "upstream unavailable",
       "data" => %{"codexErrorInfo" => %{"httpConnectionFailed" => %{"httpStatusCode" => 503}}}
     }

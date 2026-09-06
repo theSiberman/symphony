@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Tracker do
   """
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub.Client, as: GitHubClient
   alias SymphonyElixir.Tracker.Issue
 
   @adapters %{
@@ -49,7 +50,7 @@ defmodule SymphonyElixir.Tracker do
   @doc "Non-secret identity for pending holds; only GitHub and memory support holds."
   @spec exception_scope(map()) :: map()
   def exception_scope(%{kind: "github"} = settings) do
-    {api_url, repo} = SymphonyElixir.GitHub.Client.repository_identity(settings)
+    {api_url, repo} = GitHubClient.repository_identity(settings)
     %{"kind" => "github", "api_url" => api_url, "repo" => repo}
   end
 
