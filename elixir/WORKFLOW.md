@@ -28,6 +28,9 @@ hooks:
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
 agent:
+  # Optional host admission; requires GNU timeout on the scheduler host.
+  # admission_command: /deployment/bin/check-capacity
+  max_abnormal_retries: 3
   max_concurrent_agents: 10
   max_turns: 20
 codex:

@@ -12,6 +12,21 @@ the best queue position of the active tickets waiting on it, including through
 dependency chains. Ranking is recalculated each poll without interrupting running
 workers or admitting paused, excluded or still-blocked tickets.
 
+Host admission can be configured with `agent.admission_command`. It runs once
+asynchronously before an idle dispatch decision, bounded to 90 seconds (plus a
+five-second process-group kill allowance, using the host `timeout` command).
+Exit zero admits work; missing executables, failures and stale results mean host
+waiting. Polling/reconciliation remain responsive; labels and retry counts are
+unchanged by host waiting. The snapshot/API exposes `admission.status` and `reason`.
+
+Retries rejoin the ordinary dependency/priority selection when their backoff is
+due. Only running workers consume execution slots. Normal continuation resets the
+abnormal-failure count; `agent.max_abnormal_retries` defaults to three. Exhaustion
+preserves work and asks the tracker adapter to persist an exception. GitHub uses
+`needs-info` and removes queue-membership labels. An unsupported or unavailable
+adapter leaves a visible in-memory block and logs the persistence failure; that
+failure must be resolved before restarting the scheduler.
+
 ## Screenshot
 
 ![Symphony Elixir screenshot](../.github/media/elixir-screenshot.png)

@@ -35,6 +35,31 @@ defmodule SymphonyElixir.GitHub.Adapter do
     RunningLabels.reconcile(settings, ids, &client.request/5)
   end
 
+  @spec pause_issue(SymphonyElixir.Tracker.Issue.t(), String.t()) :: :ok | {:error, term()}
+  def pause_issue(issue, reason) do
+    settings = SymphonyElixir.Config.settings!().tracker
+    {_url, repo} = Client.repository_identity(settings)
+    path = "/repos/#{repo}/issues/#{issue.id}"
+    client = client_module()
+    opts = [tracker_settings: settings]
+
+    operations =
+      [{"POST", path <> "/labels", %{"labels" => ["needs-info"]}}] ++
+        Enum.map(settings.required_labels, fn label -> {"DELETE", path <> "/labels/" <> URI.encode(label, &URI.char_unreserved?/1), nil} end) ++
+        [
+          {"POST", path <> "/comments",
+           %{"body" => "Symphony preserved this candidate after repeated worker failures. #{reason}. Inspect the preserved workspace and worker logs, then restore queue membership when resolved."}}
+        ]
+
+    Enum.reduce_while(operations, :ok, fn {method, endpoint, body}, :ok ->
+      case client.request(method, endpoint, %{}, body, opts) do
+        {:ok, %{status: status}} when status in 200..299 -> {:cont, :ok}
+        {:ok, %{status: 404}} when method == "DELETE" -> {:cont, :ok}
+        error -> {:halt, {:error, {:pause_failed, error}}}
+      end
+    end)
+  end
+
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs, do: AgentTool.tool_specs()
 

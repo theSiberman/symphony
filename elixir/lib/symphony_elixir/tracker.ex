@@ -25,14 +25,26 @@ defmodule SymphonyElixir.Tracker do
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
 
+  @callback pause_issue(Issue.t(), String.t()) :: :ok | {:error, term()}
+
   @callback bind_running_labels(map()) :: map() | nil
   @callback reconcile_running_labels(map(), [String.t()]) :: :ok | {:error, term()}
 
-  @optional_callbacks bind_running_labels: 1,
+  @optional_callbacks pause_issue: 2,
+                      bind_running_labels: 1,
                       reconcile_running_labels: 2,
                       agent_tool_specs: 0,
                       execute_agent_tool: 3,
                       validate_config: 1
+
+  @spec pause_issue(Issue.t(), String.t()) :: :ok | {:error, term()}
+  def pause_issue(issue, reason) do
+    adapter = adapter()
+
+    if function_exported?(adapter, :pause_issue, 2),
+      do: adapter.pause_issue(issue, reason),
+      else: {:error, :tracker_pause_unsupported}
+  end
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do

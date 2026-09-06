@@ -2347,3 +2347,21 @@ after the runtime supervisor has stopped the prior worker tasks.
 Mutation scope is bound at startup. Changing repository, API endpoint, or managed label
 requires a restart and prevents new admissions until then; writes retain the original scope.
 Before changing ownership scope, operators must reconcile the old scope while idle.
+
+
+### Host admission and retry eligibility (Elixir extension)
+
+An optional `agent.admission_command` provides a bounded asynchronous host check
+before idle dispatch. Nonzero exit, missing results and results from replaced
+configuration are waiting states. The scheduler continues reconciliation, exposes
+the waiting reason, and rechecks on its normal poll. The command's host process
+group is bounded by GNU timeout (90 seconds, five-second forced-kill allowance).
+The deployment owns process-safe idle cleanup; the scheduler owns admission.
+
+Backoff entries preserve attempt and preferred-worker metadata but do not reserve
+execution slots. Due retries rejoin ordinary sorted selection and pass the same
+host admission as new work. Normal completion resets abnormal attempts. The
+`agent.max_abnormal_retries` limit defaults to three; exhausted candidates stay
+preserved and the adapter persists an exception when supported (GitHub:
+`needs-info`, queue labels removed). Failure to persist remains visible and requires
+resolution before restart; host waiting itself never mutates ticket state.
