@@ -1095,6 +1095,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    before_exit = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1103,7 +1104,8 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 0, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 0, 1_100)
+    assert due_at_ms >= before_exit + 1_000
+    assert due_at_ms <= System.monotonic_time(:millisecond) + 1_000
   end
 
   test "a waiting retry releases the sole execution slot" do
@@ -1834,9 +1836,8 @@ defmodule SymphonyElixir.CoreTest do
         state: "In Progress"
       }
 
-      assert_raise RuntimeError, ~r/workspace_prepare_failed/, fn ->
-        AgentRunner.run(issue, nil, worker_host: "worker-a")
-      end
+      assert {:agent_failed, {:workspace_prepare_failed, "worker-a", 75, _}} =
+               catch_exit(AgentRunner.run(issue, nil, worker_host: "worker-a"))
 
       trace = File.read!(trace_file)
       assert trace =~ "worker-a bash -lc"

@@ -10,28 +10,37 @@ defmodule SymphonyElixir.AdmissionTest do
   test "pending admission remains responsive and shortage recovers on polling", %{root: root} do
     marker = Path.join(root, "capacity")
     command = "sleep 0.2; test -f '#{marker}' || { echo disk-shortage; exit 75; }"
-    configure(command)
+    started = Path.join(root, "worker-started")
+    issue = %Issue{id: "capacity", identifier: "CAP", title: "eligible", state: "Todo", dispatchable: true}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    configure(command, hook_after_create: "touch '#{started}'; exit 1")
     pid = start_supervised!({Orchestrator, name: AdmissionRecovery})
     send(pid, :run_poll_cycle)
     assert %{admission: %{status: "waiting"}} = GenServer.call(pid, :snapshot, 100)
     eventually(fn -> :sys.get_state(pid).admission == {:waiting, "disk-shortage"} end)
-    assert {:ok, []} = Tracker.fetch_issues_by_states(["Todo"])
+    assert {:ok, [^issue]} = Tracker.fetch_issues_by_states(["Todo"])
+    refute File.exists?(started)
     File.write!(marker, "available")
     send(pid, :run_poll_cycle)
-    eventually(fn -> :sys.get_state(pid).admission == :idle end)
-    assert %{running: [], retrying: []} = GenServer.call(pid, :snapshot, 100)
+    eventually(fn -> File.exists?(started) end)
+    assert {:ok, [^issue]} = Tracker.fetch_issues_by_states(["Todo"])
   end
 
   test "a successful old probe cannot authorize after reload", %{root: root} do
     started = Path.join(root, "started")
-    configure("touch '#{started}'; sleep 0.2")
+    worker = Path.join(root, "worker-started")
+    issue = %Issue{id: "reload", identifier: "RELOAD", title: "eligible", state: "Todo", dispatchable: true}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    configure("touch '#{started}'; sleep 0.2", hook_after_create: "touch '#{worker}'; exit 1")
     pid = start_supervised!({Orchestrator, name: AdmissionReload})
     eventually(fn -> File.exists?(started) end)
-    configure("echo unavailable; exit 75")
+    configure("echo unavailable; exit 75", hook_after_create: "touch '#{worker}'; exit 1")
     eventually(fn -> :sys.get_state(pid).admission_task == nil end)
     refute :sys.get_state(pid).admission == :idle
     send(pid, :run_poll_cycle)
     eventually(fn -> :sys.get_state(pid).admission == {:waiting, "unavailable"} end)
+    refute File.exists?(worker)
+    assert {:ok, [^issue]} = Tracker.fetch_issues_by_states(["Todo"])
   end
 
   test "restart does not carry previous capacity approval", %{root: root} do
@@ -42,9 +51,15 @@ defmodule SymphonyElixir.AdmissionTest do
     eventually(fn -> :sys.get_state(pid).admission == :idle end)
     stop_supervised!(Orchestrator)
     File.rm!(marker)
+    worker = Path.join(root, "worker-started")
+    issue = %Issue{id: "restart", identifier: "RESTART", title: "eligible", state: "Todo", dispatchable: true}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    configure("test -f '#{marker}' || { echo occupied; exit 75; }", hook_after_create: "touch '#{worker}'; exit 1")
     restarted = start_supervised!({Orchestrator, name: AdmissionRestart})
     eventually(fn -> :sys.get_state(restarted).admission == {:waiting, "occupied"} end)
     assert %{running: []} = GenServer.call(restarted, :snapshot, 100)
+    refute File.exists?(worker)
+    assert {:ok, [^issue]} = Tracker.fetch_issues_by_states(["Todo"])
   end
 
   test "delayed retries do not consume the sole execution slot" do
@@ -115,12 +130,19 @@ defmodule SymphonyElixir.AdmissionTest do
     assert {:ok, []} = Tracker.fetch_issues_by_states(["Todo"])
   end
 
-  defp configure(command) do
-    write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_kind: "memory",
-      admission_command: command,
-      max_concurrent_agents: 1,
-      poll_interval_ms: 60_000
+  defp configure(command, overrides \\ []) do
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      Keyword.merge(
+        [
+          tracker_kind: "memory",
+          admission_command: command,
+          workspace_root: Path.join(Path.dirname(Workflow.workflow_file_path()), "workspaces"),
+          max_concurrent_agents: 1,
+          poll_interval_ms: 60_000
+        ],
+        overrides
+      )
     )
   end
 

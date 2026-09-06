@@ -330,3 +330,7 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 
 - <only include when something was confusing during execution>
 ````
+
+The scheduler preserves exhausted-worker holds under the workspace root until
+the tracker confirms them, replaying pending holds before dispatch after restart.
+Temporary provider or tracker errors back off without spending abnormal attempts.

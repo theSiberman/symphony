@@ -2362,6 +2362,8 @@ Backoff entries preserve attempt and preferred-worker metadata but do not reserv
 execution slots. Due retries rejoin ordinary sorted selection and pass the same
 host admission as new work. Normal completion resets abnormal attempts. The
 `agent.max_abnormal_retries` limit defaults to three; exhausted candidates stay
-preserved and the adapter persists an exception when supported (GitHub:
-`needs-info`, queue labels removed). Failure to persist remains visible and requires
-resolution before restart; host waiting itself never mutates ticket state.
+preserved. A pending exception marker under the workspace root survives restart
+and replays before dispatch until the tracker confirms the hold (GitHub:
+`needs-info`, queue labels removed). Unreadable markers stop admission visibly.
+Temporary provider and tracker errors retain the abnormal count and always have
+positive backoff; host waiting itself never mutates ticket state.

@@ -35,6 +35,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       :running_labels,
       task_supervisor: SymphonyElixir.TaskSupervisor,
+      exception_error: nil,
       admission_task: nil,
       admission_command: nil,
       admission: :unchecked,
@@ -266,13 +267,17 @@ defmodule SymphonyElixir.Orchestrator do
   defp retry_agent_down(state, issue_id, running_entry, session_id, reason) do
     Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
-    next_attempt = next_retry_attempt_from_running(running_entry) || 1
+    next_attempt =
+      if transient_failure?(reason),
+        do: Map.get(running_entry, :retry_attempt, 0),
+        else: next_retry_attempt_from_running(running_entry) || 1
+
     error = "agent exited: #{inspect(reason)}"
 
     if next_attempt > Config.settings!().agent.max_abnormal_retries do
-      pause_result = Tracker.pause_issue(running_entry.issue, error)
-      if pause_result != :ok, do: Logger.error("Could not persist failure exception issue_id=#{issue_id}: #{inspect(pause_result)}")
-      block_issue_from_entry(state, issue_id, running_entry, "retry limit reached: #{error}; tracker pause: #{inspect(pause_result)}")
+      state = block_issue_from_entry(state, issue_id, running_entry, "retry limit reached: #{error}")
+      state = put_in(state.blocked[issue_id][:pending_exception], error)
+      replay_pending_exceptions(state)
     else
       schedule_issue_retry(state, issue_id, next_attempt, %{
         identifier: running_entry.identifier,
@@ -281,6 +286,45 @@ defmodule SymphonyElixir.Orchestrator do
         worker_host: Map.get(running_entry, :worker_host),
         workspace_path: Map.get(running_entry, :workspace_path)
       })
+    end
+  end
+
+  defp transient_failure?({:agent_failed, {kind, _detail}})
+       when kind in [:issue_state_refresh_failed, :response_error, :turn_failed], do: true
+
+  defp transient_failure?(_reason), do: false
+
+  defp replay_pending_exceptions(state) do
+    writes =
+      for {_id, entry} <- state.blocked, entry[:pending_exception] != nil do
+        Workspace.record_exception(entry.issue, entry.pending_exception)
+      end
+
+    with nil <- Enum.find(writes, &(&1 != :ok)),
+         {:ok, pending} <- Workspace.pending_exceptions() do
+      Enum.reduce(pending, %{state | exception_error: nil}, &replay_exception/2)
+    else
+      error ->
+        reason = "Cannot preserve pending worker exception: #{inspect(error)}"
+        Logger.error(reason)
+        %{state | exception_error: reason}
+    end
+  end
+
+  defp replay_exception(%{"id" => id, "identifier" => identifier, "reason" => reason}, state) do
+    issue = %Issue{id: id, identifier: identifier}
+    state = block_issue_from_entry(state, id, %{issue: issue, identifier: identifier}, reason)
+
+    case Tracker.pause_issue(issue, reason) do
+      :ok ->
+        case Workspace.clear_exception(issue) do
+          :ok -> state
+          error -> %{state | exception_error: "Cannot clear persisted worker exception: #{inspect(error)}"}
+        end
+
+      error ->
+        Logger.warning("Pending worker exception issue_id=#{id}: #{inspect(error)}")
+        state
     end
   end
 
@@ -309,7 +353,7 @@ defmodule SymphonyElixir.Orchestrator do
         state
       end
 
-    state = state |> reconcile_running_labels() |> check_admission()
+    state = state |> replay_pending_exceptions() |> reconcile_running_labels() |> check_admission()
 
     state =
       with :ok <- validate_label_ownership(state),
@@ -373,6 +417,9 @@ defmodule SymphonyElixir.Orchestrator do
     command = Config.settings!().agent.admission_command
 
     cond do
+      state.exception_error != nil ->
+        %{state | admission: {:waiting, state.exception_error}}
+
       state.admission_task != nil ->
         state
 
@@ -400,8 +447,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp admission_available?(state) do
-    Config.settings!().agent.admission_command == nil or
-      (state.admission == :available and state.admission_command == Config.settings!().agent.admission_command)
+    state.exception_error == nil and
+      (Config.settings!().agent.admission_command == nil or
+         (state.admission == :available and state.admission_command == Config.settings!().agent.admission_command))
   end
 
   defp reconcile_running_issues(%State{} = state) do
@@ -1370,7 +1418,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp failure_retry_delay(attempt) do
-    max_delay_power = min(attempt - 1, 10)
+    max_delay_power = min(max(attempt - 1, 0), 10)
     min(@failure_retry_base_ms * (1 <<< max_delay_power), Config.settings!().agent.max_retry_backoff_ms)
   end
 

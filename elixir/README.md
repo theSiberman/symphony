@@ -22,10 +22,12 @@ unchanged by host waiting. The snapshot/API exposes `admission.status` and `reas
 Retries rejoin the ordinary dependency/priority selection when their backoff is
 due. Only running workers consume execution slots. Normal continuation resets the
 abnormal-failure count; `agent.max_abnormal_retries` defaults to three. Exhaustion
-preserves work and asks the tracker adapter to persist an exception. GitHub uses
-`needs-info` and removes queue-membership labels. An unsupported or unavailable
-adapter leaves a visible in-memory block and logs the persistence failure; that
-failure must be resolved before restarting the scheduler.
+preserves work and records a pending exception under the workspace root before
+asking the tracker to hold the issue. GitHub uses `needs-info` and removes queue
+labels. Pending writes replay before dispatch, including after restart; the marker
+is removed only after the tracker confirms the hold. Unreadable markers block
+admission visibly. Temporary provider and tracker errors retain the abnormal
+count and retry with a positive backoff.
 
 ## Screenshot
 
