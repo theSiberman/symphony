@@ -63,6 +63,8 @@ defmodule SymphonyElixir.FailureRecoveryTest do
   end
 
   test "a real continuation retry timer backs off tracker errors without spending abnormal attempts", %{root: root, issue: issue} do
+    capacity = Path.join(root, "capacity")
+    configure(root, "test -f '#{capacity}' || exit 75")
     update(%{lookup_error: true})
     pid = start_supervised!({Orchestrator, name: RetryLookupRecovery})
     crash(pid, issue, 0, :normal)
@@ -72,9 +74,16 @@ defmodule SymphonyElixir.FailureRecoveryTest do
     assert Agent.get(OfflineGitHub, & &1.issues) == [issue]
     update(%{lookup_error: false})
     # Let the actual retry timer expire into the same host admission boundary.
-    eventually(fn -> :sys.get_state(pid).retry_attempts[issue.id][:due_at_ms] <= System.monotonic_time(:millisecond) end, 1_500)
+    eventually(
+      fn ->
+        state = :sys.get_state(pid)
+        state.retry_attempts[issue.id][:retry_token] == nil and state.admission_task == nil
+      end,
+      1_500
+    )
+
     refute File.exists?(Path.join(root, "worker-started"))
-    configure(root, "true")
+    File.write!(capacity, "available")
     send(pid, :run_poll_cycle)
     eventually(fn -> File.exists?(Path.join(root, "worker-started")) end)
   end
