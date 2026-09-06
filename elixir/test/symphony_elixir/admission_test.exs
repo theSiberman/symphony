@@ -18,7 +18,7 @@ defmodule SymphonyElixir.AdmissionTest do
     assert {:ok, []} = Tracker.fetch_issues_by_states(["Todo"])
     File.write!(marker, "available")
     send(pid, :run_poll_cycle)
-    eventually(fn -> :sys.get_state(pid).admission == :available end)
+    eventually(fn -> :sys.get_state(pid).admission == :idle end)
     assert %{running: [], retrying: []} = GenServer.call(pid, :snapshot, 100)
   end
 
@@ -29,7 +29,7 @@ defmodule SymphonyElixir.AdmissionTest do
     eventually(fn -> File.exists?(started) end)
     configure("echo unavailable; exit 75")
     eventually(fn -> :sys.get_state(pid).admission_task == nil end)
-    refute :sys.get_state(pid).admission == :available
+    refute :sys.get_state(pid).admission == :idle
     send(pid, :run_poll_cycle)
     eventually(fn -> :sys.get_state(pid).admission == {:waiting, "unavailable"} end)
   end
@@ -39,7 +39,7 @@ defmodule SymphonyElixir.AdmissionTest do
     File.write!(marker, "available")
     configure("test -f '#{marker}' || { echo occupied; exit 75; }")
     pid = start_supervised!({Orchestrator, name: AdmissionRestart})
-    eventually(fn -> :sys.get_state(pid).admission == :available end)
+    eventually(fn -> :sys.get_state(pid).admission == :idle end)
     stop_supervised!(Orchestrator)
     File.rm!(marker)
     restarted = start_supervised!({Orchestrator, name: AdmissionRestart})

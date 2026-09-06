@@ -311,53 +311,60 @@ defmodule SymphonyElixir.Orchestrator do
 
     state = state |> reconcile_running_labels() |> check_admission()
 
-    with :ok <- validate_label_ownership(state),
-         :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
-         true <- available_slots(state) > 0 and admission_available?(state) do
-      choose_issues(issues, state)
-    else
-      {:error, :missing_linear_api_token} ->
-        Logger.error("Tracker API token missing in WORKFLOW.md")
-        state
+    state =
+      with :ok <- validate_label_ownership(state),
+           :ok <- Config.validate!(),
+           {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
+           true <- available_slots(state) > 0 and admission_available?(state) do
+        choose_issues(issues, state)
+      else
+        {:error, :missing_linear_api_token} ->
+          Logger.error("Tracker API token missing in WORKFLOW.md")
+          state
 
-      {:error, :missing_linear_project_slug} ->
-        Logger.error("Tracker project scope missing in WORKFLOW.md")
-        state
+        {:error, :missing_linear_project_slug} ->
+          Logger.error("Tracker project scope missing in WORKFLOW.md")
+          state
 
-      {:error, :missing_tracker_kind} ->
-        Logger.error("Tracker kind missing in WORKFLOW.md")
+        {:error, :missing_tracker_kind} ->
+          Logger.error("Tracker kind missing in WORKFLOW.md")
 
-        state
+          state
 
-      {:error, {:unsupported_tracker_kind, kind}} ->
-        Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
+        {:error, {:unsupported_tracker_kind, kind}} ->
+          Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
 
-        state
+          state
 
-      {:error, {:invalid_workflow_config, message}} ->
-        Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
+        {:error, {:invalid_workflow_config, message}} ->
+          Logger.error("Invalid WORKFLOW.md config: #{message}")
+          state
 
-      {:error, {:missing_workflow_file, path, reason}} ->
-        Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
+        {:error, {:missing_workflow_file, path, reason}} ->
+          Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
+          state
 
-      {:error, :workflow_front_matter_not_a_map} ->
-        Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
+        {:error, :workflow_front_matter_not_a_map} ->
+          Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
+          state
 
-      {:error, {:workflow_parse_error, reason}} ->
-        Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
+        {:error, {:workflow_parse_error, reason}} ->
+          Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
+          state
 
-      {:error, reason} ->
-        Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
-        state
+        {:error, reason} ->
+          Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
+          state
 
-      false ->
-        state
-    end
+        false ->
+          state
+      end
+
+    # Consume approval even when the queue is empty or tracker reads fail.
+    # The next poll must inspect current host ownership before selecting work.
+    if Config.settings!().agent.admission_command != nil and state.admission == :available,
+      do: %{state | admission: :idle},
+      else: state
   end
 
   # Admission is host state, never a ticket failure or tracker mutation. The
