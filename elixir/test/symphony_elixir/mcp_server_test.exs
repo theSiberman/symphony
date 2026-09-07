@@ -1,7 +1,11 @@
 defmodule SymphonyElixir.McpServerTest do
   use SymphonyElixir.TestSupport
 
+  import Phoenix.ConnTest
+
   alias SymphonyElixir.Mcp.Server
+
+  @endpoint SymphonyElixirWeb.Endpoint
 
   @tool_spec %{
     "name" => "github_api",
@@ -106,6 +110,30 @@ defmodule SymphonyElixir.McpServerTest do
     end
   end
 
+  describe "streamable-HTTP transport" do
+    test "answers a stream probe with 405 and an allow header, not 404" do
+      start_test_endpoint()
+
+      conn = get(build_conn(), "/mcp")
+
+      # 404 would tell the client it had the wrong URL and invite a retry
+      # against another path; 405 says the endpoint exists and offers no stream.
+      assert conn.status == 405
+      assert Plug.Conn.get_resp_header(conn, "allow") == ["POST"]
+    end
+
+    test "still serves JSON-RPC over POST" do
+      start_test_endpoint()
+
+      conn =
+        build_conn()
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+        |> post("/mcp", Jason.encode!(%{"jsonrpc" => "2.0", "id" => 9, "method" => "initialize"}))
+
+      assert json_response(conn, 200)["result"]["serverInfo"]["name"] == "symphony-tracker"
+    end
+  end
+
   describe "registration" do
     test "describes itself as a remote MCP server for an opencode instance" do
       config = Server.remote_config("http://127.0.0.1:4000/mcp")
@@ -118,5 +146,15 @@ defmodule SymphonyElixir.McpServerTest do
       with_headers = Server.remote_config("http://x/mcp", headers: %{"authorization" => "Bearer t"})
       assert with_headers["headers"] == %{"authorization" => "Bearer t"}
     end
+  end
+
+  defp start_test_endpoint do
+    endpoint_config =
+      :symphony_elixir
+      |> Application.get_env(SymphonyElixirWeb.Endpoint, [])
+      |> Keyword.merge(server: false, secret_key_base: String.duplicate("s", 64))
+
+    Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
+    start_supervised!({SymphonyElixirWeb.Endpoint, []})
   end
 end
