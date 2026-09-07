@@ -30,6 +30,9 @@ defmodule SymphonyElixir.Opencode.Adapter do
   def capabilities do
     %{
       structured_usage: true,
+      # Reports at turn boundaries only: one synchronous request spans the turn,
+      # so there is nothing to emit in between. Silence is not a stall here.
+      streams_progress: false,
       rate_limit_reporting: false,
       sandbox_enforcement: false,
       session_resume: true

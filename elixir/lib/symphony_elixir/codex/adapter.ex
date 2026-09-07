@@ -44,6 +44,7 @@ defmodule SymphonyElixir.Codex.Adapter do
   def capabilities do
     %{
       structured_usage: true,
+      streams_progress: true,
       rate_limit_reporting: true,
       sandbox_enforcement: true,
       session_resume: true

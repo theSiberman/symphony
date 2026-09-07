@@ -747,6 +747,12 @@ defmodule SymphonyElixir.Orchestrator do
       timeout_ms <= 0 ->
         state
 
+      # A runtime that reports only at turn boundaries is silent for the whole
+      # turn by design; "time since last update" is not a liveness signal for it,
+      # and its bound is the turn budget instead.
+      not AgentRuntime.progress_silence_implies_stall?() ->
+        state
+
       map_size(state.running) == 0 ->
         state
 

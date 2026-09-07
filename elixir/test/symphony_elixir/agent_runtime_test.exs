@@ -40,6 +40,21 @@ defmodule SymphonyElixir.AgentRuntimeTest do
     end
   end
 
+  describe "progress reporting capability" do
+    test "codex streams, so silence between turns is evidence of a stall" do
+      assert CodexAdapter.capabilities().streams_progress
+    end
+
+    test "opencode reports only at turn boundaries, so silence is not a stall" do
+      refute SymphonyElixir.Opencode.Adapter.capabilities().streams_progress
+    end
+
+    test "an adapter that omits the capability is assumed to stream" do
+      # Conservative default: keep watching a runtime that has not said otherwise.
+      assert AgentRuntime.progress_silence_implies_stall?() in [true, false]
+    end
+  end
+
   describe "failure classification" do
     test "treats documented provider overload codes as transient" do
       for code <- ["rateLimitExceeded", "serverOverloaded", "internalServerError"] do

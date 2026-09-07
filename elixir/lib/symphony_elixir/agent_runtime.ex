@@ -29,6 +29,7 @@ defmodule SymphonyElixir.AgentRuntime do
   """
   @type capabilities :: %{
           structured_usage: boolean(),
+          streams_progress: boolean(),
           rate_limit_reporting: boolean(),
           sandbox_enforcement: boolean(),
           session_resume: boolean()
@@ -82,6 +83,18 @@ defmodule SymphonyElixir.AgentRuntime do
 
   @spec capabilities() :: capabilities()
   def capabilities, do: adapter().capabilities()
+
+  @doc """
+  Whether silence between turn start and turn end means the worker is stuck.
+
+  A runtime that streams tool calls and tokens is expected to keep reporting, so
+  a gap is evidence of a stall. A runtime that reports only at turn boundaries is
+  silent for the whole turn by design, and its liveness bound is the turn budget.
+  """
+  @spec progress_silence_implies_stall?() :: boolean()
+  def progress_silence_implies_stall? do
+    Map.get(capabilities(), :streams_progress, true)
+  end
 
   @spec classify_failure(term()) :: :transient | :terminal
   def classify_failure(reason), do: adapter().classify_failure(reason)
