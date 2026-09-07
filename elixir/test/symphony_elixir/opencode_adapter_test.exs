@@ -150,6 +150,33 @@ defmodule SymphonyElixir.OpencodeAdapterTest do
     end
   end
 
+  describe "turn budget" do
+    test "an overrun turn is terminal, not a transient transport blip" do
+      request_fun =
+        fake_server(%{
+          "/session" => {:ok, %{"id" => "ses_abc"}},
+          "/session/ses_abc/message" => {:error, {:opencode_transport_error, %Req.TransportError{reason: :timeout}}}
+        })
+
+      {:ok, session} = start_session(request_fun)
+
+      assert {:error, {:turn_failed, %{"name" => "TurnBudgetExceeded"} = detail}} =
+               Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun)
+
+      assert detail["data"]["turn_timeout_ms"] == @settings.turn_timeout_ms
+
+      # Retrying spends the entire budget again on a turn that overruns again.
+      assert Adapter.classify_failure({:turn_failed, detail}) == :terminal
+    end
+
+    test "a transport failure that is not the turn budget stays transient" do
+      closed = %Req.TransportError{reason: :closed}
+      failure = {:response_error, {:opencode_transport_error, closed}}
+
+      assert Adapter.classify_failure(failure) == :transient
+    end
+  end
+
   describe "failure classification" do
     test "retries a server-side outage" do
       for name <- ["ServiceUnavailableError", "SessionBusyError"] do

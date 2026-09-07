@@ -89,8 +89,24 @@ defmodule SymphonyElixir.Opencode.Adapter do
       |> Keyword.put(:receive_timeout, settings.turn_timeout_ms)
 
     case Client.send_message(session.base_url, session.session_id, body, request_opts) do
-      {:ok, message} -> complete_turn(session, message)
-      {:error, reason} -> {:error, {:response_error, reason}}
+      {:ok, message} ->
+        complete_turn(session, message)
+
+      # run_turn sets the receive timeout to the turn budget, so a read timeout
+      # here is the turn overrunning that budget, not a flaky connection.
+      # Reported as a transport error it classifies transient, and the
+      # orchestrator then spends the whole budget again on a turn that will
+      # overrun again — GH-263 was on course to burn four hours that way.
+      {:error, {:opencode_transport_error, %{reason: :timeout}}} ->
+        {:error,
+         {:turn_failed,
+          %{
+            "name" => "TurnBudgetExceeded",
+            "data" => %{"turn_timeout_ms" => settings.turn_timeout_ms}
+          }}}
+
+      {:error, reason} ->
+        {:error, {:response_error, reason}}
     end
   end
 
