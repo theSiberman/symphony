@@ -150,6 +150,43 @@ defmodule SymphonyElixir.OpencodeAdapterTest do
     end
   end
 
+  describe "dashboard visibility" do
+    test "reports session start and turn completion so a live worker is distinguishable from a hung one" do
+      request_fun =
+        fake_server(%{
+          "/session" => {:ok, %{"id" => "ses_abc"}},
+          "/session/ses_abc/message" => {:ok, %{"info" => %{"tokens" => %{"input" => 40, "output" => 5}, "cost" => 0.01}}}
+        })
+
+      {:ok, session} = start_session(request_fun)
+      parent = self()
+      on_message = fn update -> send(parent, {:update, update}) end
+
+      assert {:ok, _} =
+               Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun, on_message: on_message)
+
+      assert_received {:update, %{event: :session_started, session_id: "ses_abc", timestamp: %DateTime{}}}
+      assert_received {:update, %{event: :turn_completed, session_id: "ses_abc"} = completed}
+
+      # The orchestrator reads usage straight off the update it was handed.
+      assert {usage, nil} = Adapter.extract_usage(completed)
+      assert usage["input_tokens"] == 40
+      assert usage["output_tokens"] == 5
+      assert usage["cost_usd"] == 0.01
+    end
+
+    test "runs without a handler, so a caller that wants no updates is not a crash" do
+      request_fun =
+        fake_server(%{
+          "/session" => {:ok, %{"id" => "ses_abc"}},
+          "/session/ses_abc/message" => {:ok, %{"info" => %{}}}
+        })
+
+      {:ok, session} = start_session(request_fun)
+      assert {:ok, _} = Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun)
+    end
+  end
+
   describe "turn budget" do
     test "an overrun turn is terminal, not a transient transport blip" do
       request_fun =

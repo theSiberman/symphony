@@ -88,8 +88,24 @@ defmodule SymphonyElixir.Opencode.Adapter do
       |> request_opts(opts)
       |> Keyword.put(:receive_timeout, settings.turn_timeout_ms)
 
+    notify(opts, %{
+      event: :session_started,
+      timestamp: DateTime.utc_now(),
+      session_id: session.session_id
+    })
+
     case Client.send_message(session.base_url, session.session_id, body, request_opts) do
       {:ok, message} ->
+        # Without this the orchestrator never learns a turn happened: the
+        # dashboard shows 0 tokens and no session for a worker that is running
+        # normally, which is indistinguishable from one that is hung.
+        notify(opts, %{
+          event: :turn_completed,
+          timestamp: DateTime.utc_now(),
+          session_id: session.session_id,
+          message: message
+        })
+
         complete_turn(session, message)
 
       # run_turn sets the receive timeout to the turn budget, so a read timeout
@@ -192,7 +208,9 @@ defmodule SymphonyElixir.Opencode.Adapter do
   defp assistant_message(update) do
     cond do
       is_map(Map.get(update, "info")) -> Map.get(update, "info")
+      is_map(Map.get(update, :info)) -> Map.get(update, :info)
       is_map(Map.get(update, "message")) -> assistant_message(Map.get(update, "message"))
+      is_map(Map.get(update, :message)) -> assistant_message(Map.get(update, :message))
       is_map(update) -> update
       true -> %{}
     end
@@ -270,6 +288,16 @@ defmodule SymphonyElixir.Opencode.Adapter do
       username: System.get_env("OPENCODE_SERVER_USERNAME", "opencode")
     ]
     |> Keyword.merge(Keyword.take(opts, [:request_fun, :receive_timeout]))
+  end
+
+  # The orchestrator accepts {:codex_worker_update, issue_id, %{event:, timestamp:}}.
+  defp notify(opts, update) do
+    case Keyword.get(opts, :on_message) do
+      handler when is_function(handler, 1) -> handler.(update)
+      _ -> :ok
+    end
+
+    :ok
   end
 
   defp maybe_put(map, _key, nil), do: map
