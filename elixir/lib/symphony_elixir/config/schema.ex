@@ -149,6 +149,9 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
+      # Selects the AgentRuntime adapter. Defaults to codex so every existing
+      # workflow file keeps its meaning without an edit.
+      field(:kind, :string, default: "codex")
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:admission_command, :string)
@@ -164,6 +167,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> cast(
         attrs,
         [
+          :kind,
           :max_concurrent_agents,
           :max_turns,
           :admission_command,
@@ -173,6 +177,9 @@ defmodule SymphonyElixir.Config.Schema do
           :redispatch_on_transition_to
         ],
         empty_values: []
+      )
+      |> validate_inclusion(:kind, SymphonyElixir.AgentRuntime.supported_kinds(),
+        message: "is not a supported agent runtime (expected one of #{Enum.join(SymphonyElixir.AgentRuntime.supported_kinds(), ", ")})"
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
@@ -245,6 +252,59 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Opencode do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      # Launch command for the headless server. Ignored when base_url is set,
+      # which lets an operator point at a server they supervise themselves.
+      field(:command, :string, default: "opencode serve")
+      field(:base_url, :string)
+      field(:port, :integer, default: 4096)
+      field(:host, :string, default: "127.0.0.1")
+      # provider/model, as `opencode models` prints it.
+      field(:model, :string)
+      field(:agent, :string, default: "build")
+      # Provider-specific reasoning effort.
+      field(:variant, :string)
+      # Where the agent reaches Symphony's tracker tools. Unset means the agent
+      # runs without tracker tools, which the adapter reports rather than hides.
+      field(:mcp_url, :string)
+      field(:turn_timeout_ms, :integer, default: 3_600_000)
+      field(:read_timeout_ms, :integer, default: 30_000)
+      field(:startup_timeout_ms, :integer, default: 30_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :command,
+          :base_url,
+          :port,
+          :host,
+          :model,
+          :agent,
+          :variant,
+          :mcp_url,
+          :turn_timeout_ms,
+          :read_timeout_ms,
+          :startup_timeout_ms
+        ],
+        empty_values: []
+      )
+      |> validate_number(:port, greater_than: 0, less_than: 65_536)
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
+      |> validate_number(:read_timeout_ms, greater_than: 0)
+      |> validate_number(:startup_timeout_ms, greater_than: 0)
+    end
+  end
+
   defmodule Hooks do
     @moduledoc false
     use Ecto.Schema
@@ -314,6 +374,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:opencode, Opencode, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -408,6 +469,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:opencode, with: &Opencode.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)

@@ -1261,7 +1261,7 @@ defmodule SymphonyElixir.CoreTest do
       tick_timer_ref: nil,
       tick_token: stale_tick_token,
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-      codex_rate_limits: nil
+      agent_rate_limits: nil
     }
 
     assert {:reply, %{queued: true, coalesced: false}, refreshed_state} =
