@@ -7,6 +7,30 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 > Symphony Elixir is prototype software intended for evaluation only and is presented as-is.
 > We recommend implementing your own hardened version based on `SPEC.md`.
 
+The dispatch queue defaults to priority, then oldest first. A newer blocker inherits
+the best queue position of the active tickets waiting on it, including through
+dependency chains. Ranking is recalculated each poll without interrupting running
+workers or admitting paused, excluded or still-blocked tickets.
+
+Host admission can be configured with `agent.admission_command`. It runs once
+asynchronously before an idle dispatch decision, bounded to 90 seconds (plus a
+five-second process-group kill allowance, using the host `timeout` command).
+Exit zero admits work; missing executables, failures and stale results mean host
+waiting. Polling/reconciliation remain responsive; labels and retry counts are
+unchanged by host waiting. The snapshot/API exposes `admission.status` and `reason`.
+
+Retries rejoin the ordinary dependency/priority selection when their backoff is
+due. Only running workers consume execution slots. Normal continuation resets the
+abnormal-failure count; `agent.max_abnormal_retries` defaults to three. Exhaustion
+preserves work and records a pending exception under the workspace root before
+asking the tracker to hold the issue. GitHub uses `needs-info` and removes queue
+labels. Pending writes replay before dispatch, including after restart; the marker
+is removed only after the tracker confirms the hold. Markers carry their original
+non-secret repository identity; a scope change cannot redirect a pending hold.
+Unreadable or mismatched markers block
+admission visibly. Temporary provider and tracker errors retain the abnormal
+count and retry with a positive backoff.
+
 ## Screenshot
 
 ![Symphony Elixir screenshot](../.github/media/elixir-screenshot.png)
@@ -254,6 +278,18 @@ codex:
   `tracker.provider.state_source: labels` to use labels as workflow states instead; then list the
   active and terminal label names in `active_states` and `terminal_states`. Comparisons ignore case,
   while the provider's original label spelling is retained on the normalized issue.
+- Running audit label: opt in with `tracker.provider.managed_running_label: in-progress`.
+  This grants this scheduler exclusive ownership of that label across the entire repository,
+  including closed issues and issues outside a spec filter. Use a separate label for other
+  schedulers or human work. It must differ from required labels and label-based workflow states.
+  Symphony removes stale markers before startup admission, after worker exit/termination, and
+  on every poll; it adds missing markers for running workers. Backoff and blocked claims do not
+  count as running. API failures are logged and retried on the next poll without failing workers.
+  A forced process shutdown is repaired on the next startup. Repository, API endpoint, or managed
+  label changes require a scheduler restart: existing label writes retain their original scope,
+  and admissions stop until restart. Keep the old ownership setting through a final idle
+  reconciliation before changing it, so labels in the old scope are removed. Token environment
+  references remain resolved at request time. Agents should leave this audit label to Symphony.
 - Frontier and scope: label-state polling follows all pages of GitHub's native `blocked_by`
   relationship. An issue with any open blocker remains visible but is non-dispatchable; it becomes
   eligible on the first poll after its final blocker closes. Dispatch is revalidated immediately

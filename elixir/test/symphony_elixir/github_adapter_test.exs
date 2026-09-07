@@ -312,6 +312,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     assert issue.blocked_by == []
     assert issue.dispatchable
     refute blocked_issue.dispatchable
+    assert blocked_issue.priority_inheritable
     assert blocked_issue.blocked_by == [%{"id" => 1041, "identifier" => "GH-41", "state" => "open"}]
   end
 
@@ -375,6 +376,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
              GitHubClient.fetch_issues_by_states_for_test(["in-progress"], settings, request_fun)
 
     refute issue.dispatchable
+    refute issue.priority_inheritable
   end
 
   test "spec scoping fails closed for unrelated active issues" do
@@ -406,6 +408,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
              )
 
     refute issue.dispatchable
+    refute issue.priority_inheritable
   end
 
   test "label-state polling checks every page of native blockers" do

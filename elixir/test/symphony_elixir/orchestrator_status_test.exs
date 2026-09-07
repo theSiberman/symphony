@@ -972,7 +972,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              due_at_ms: due_at_ms,
              identifier: "MT-STALL",
              issue_url: "https://example.org/issues/MT-STALL",
-             error: "stalled for " <> _
+             error: "agent exited: {:stalled, " <> _
            } = state.retry_attempts[issue_id]
 
     assert is_integer(due_at_ms)

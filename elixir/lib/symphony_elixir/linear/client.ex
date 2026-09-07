@@ -481,6 +481,7 @@ defmodule SymphonyElixir.Linear.Client do
         assignee_id: assignee_field(assignee, "id"),
         blocked_by: blockers,
         labels: extract_labels(issue),
+        priority_inheritable: assigned_to_worker?(assignee, assignee_filter),
         dispatchable: dispatchable?(state_name, blockers, assignee, assignee_filter),
         created_at: parse_datetime(issue["createdAt"]),
         updated_at: parse_datetime(issue["updatedAt"])

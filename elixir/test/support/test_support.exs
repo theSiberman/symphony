@@ -103,6 +103,7 @@ defmodule SymphonyElixir.TestSupport do
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
+          agent_kind: nil,
           max_concurrent_agents: 10,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
@@ -184,8 +185,10 @@ defmodule SymphonyElixir.TestSupport do
         "  root: #{yaml_value(workspace_root)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
+        agent_kind_yaml(Keyword.get(config, :agent_kind)),
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
+        "  admission_command: #{yaml_value(Keyword.get(config, :admission_command))}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "  redispatch_on_transition_to: #{yaml_value(redispatch_on_transition_to)}",
@@ -244,6 +247,9 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
   end
+
+  defp agent_kind_yaml(nil), do: nil
+  defp agent_kind_yaml(kind), do: "  kind: #{yaml_value(kind)}"
 
   defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host)
        when ssh_hosts in [nil, []] and is_nil(max_concurrent_agents_per_host),

@@ -193,6 +193,9 @@ Fields:
   - REQUIRED adapter-derived eligibility for provider-specific rules that the generic scheduler
     cannot infer safely, such as assignment, board membership, or blocker semantics.
   - The orchestrator still applies configured state, label, claim, retry, and concurrency rules.
+- `priority_inheritable` (boolean, default true)
+  - False when adapter scope/routing excludes an issue independently of its blockers.
+  - Dependency-blocked issues remain eligible to contribute priority.
 - `created_at` (timestamp or null)
 - `updated_at` (timestamp or null)
 
@@ -772,11 +775,22 @@ For refresh and continuation checks, `issue_routable(issue)` means only that ada
 `dispatchable` is true and all `tracker.required_labels` match. State, claims, and concurrency are
 checked separately by the surrounding algorithm.
 
-Sorting order (stable intent):
+Original sorting rank (stable intent):
 
 1. `priority` ascending for values `1..4`; all other integers and null sort after that bucket
 2. `created_at` oldest first; null sorts last
 3. `identifier` lexicographic tie-breaker
+
+At each poll, an active, required-labelled issue with `priority_inheritable=true`
+propagates its original rank to its open blockers transitively. Each issue sorts by
+the best rank reaching it, then its own original rank for deterministic ties. Only
+issues present in the candidate snapshot participate: missing dependencies are not
+automatically fetched or admitted. Terminal edges/targets, paused issues and adapter-excluded
+issues do not relay rank. Resolve a blocker by identifier when supplied, otherwise
+by canonical dispatch ID; provider database IDs must not collide with issue numbers.
+Cycles terminate without making any blocked issue dispatchable. Recompute from the
+current graph on every poll; preserve all eligibility, claim and concurrency checks
+and do not preempt running workers.
 
 ### 8.3 Concurrency Control
 
@@ -2125,7 +2139,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
-- Dispatch sort order is priority then oldest creation time
+- Dispatch sort order inherits the best priority/creation rank through open dependencies
 - `dispatchable=false` issues are not eligible
 - Required-label filtering is case-insensitive and applies after adapter normalization
 - Active-state issue refresh updates running entry state
@@ -2314,3 +2328,43 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+### Optional scheduler-owned running audit labels
+
+An adapter MAY provide an opt-in audit-label reconciliation callback. The configured label
+MUST be exclusively owned by one scheduler within its documented scope, and MUST NOT also
+control required-label eligibility or label-based workflow states. GitHub's
+`tracker.provider.managed_running_label` applies repository-wide, including closed issues,
+independently of dispatch filters. Other labels and PRs remain untouched.
+
+The scheduler reconciles from its running map before startup admission, after worker exit or
+termination, after admission, and on subsequent polls (including failed candidate reads).
+Retry claims and blocked issues are not running workers. Reconciliation is serialized with
+admission; enumeration completes before mutation. API failures retain retryable work for the
+next poll and do not fail agent tasks. Forced shutdown cleanup occurs on the next startup,
+after the runtime supervisor has stopped the prior worker tasks.
+
+Mutation scope is bound at startup. Changing repository, API endpoint, or managed label
+requires a restart and prevents new admissions until then; writes retain the original scope.
+Before changing ownership scope, operators must reconcile the old scope while idle.
+
+
+### Host admission and retry eligibility (Elixir extension)
+
+An optional `agent.admission_command` provides a bounded asynchronous host check
+before idle dispatch. Nonzero exit, missing results and results from replaced
+configuration are waiting states. The scheduler continues reconciliation, exposes
+the waiting reason, and rechecks on its normal poll. The command's host process
+group is bounded by GNU timeout (90 seconds, five-second forced-kill allowance).
+The deployment owns process-safe idle cleanup; the scheduler owns admission.
+
+Backoff entries preserve attempt and preferred-worker metadata but do not reserve
+execution slots. Due retries rejoin ordinary sorted selection and pass the same
+host admission as new work. Normal completion resets abnormal attempts. The
+`agent.max_abnormal_retries` limit defaults to three; exhausted candidates stay
+preserved. A pending exception marker under the workspace root survives restart
+and replays before dispatch until the tracker confirms the hold (GitHub:
+`needs-info`, queue labels removed). Markers bind the original non-secret tracker
+scope; unreadable markers or a scope mismatch stop admission visibly.
+Temporary provider and tracker errors retain the abnormal count and always have
+positive backoff; host waiting itself never mutates ticket state.

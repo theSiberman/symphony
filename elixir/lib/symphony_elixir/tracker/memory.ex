@@ -30,6 +30,19 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec pause_issue(Issue.t(), String.t()) :: :ok
+  def pause_issue(issue, _reason) do
+    Application.put_env(
+      :symphony_elixir,
+      :memory_tracker_issues,
+      Enum.map(issue_entries(), fn current ->
+        if current.id == issue.id, do: %{current | state: "needs-info", labels: ["needs-info"]}, else: current
+      end)
+    )
+
+    :ok
+  end
+
   @spec secret_environment_names(map()) :: [String.t()]
   def secret_environment_names(_tracker_settings), do: []
 

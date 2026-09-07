@@ -10,6 +10,59 @@ defmodule SymphonyElixir.Workspace do
 
   @type worker_host :: String.t() | nil
 
+  # These markers exist only while an exhausted-worker hold is being written to
+  # the tracker. They also cover failures before a ticket checkout exists.
+  @spec record_exception(map(), String.t(), map()) :: :ok | {:error, term()}
+  def record_exception(issue, reason, scope) do
+    with {:ok, directory} <- exception_directory(),
+         :ok <- File.mkdir_p(directory) do
+      path = Path.join(directory, workspace_key(issue) <> ".json")
+
+      with :ok <- validate_local_workspace_path(path, directory) do
+        File.write(path, Jason.encode!(%{id: issue.id, identifier: issue.identifier, reason: reason, scope: scope}), [:sync])
+      end
+    end
+  end
+
+  @spec pending_exceptions() :: {:ok, [map()]} | {:error, term()}
+  def pending_exceptions do
+    with {:ok, directory} <- exception_directory() do
+      case File.ls(directory) do
+        {:error, :enoent} -> {:ok, []}
+        {:error, reason} -> {:error, reason}
+        {:ok, files} -> read_exceptions(directory, files)
+      end
+    end
+  end
+
+  @spec clear_exception(map()) :: :ok | {:error, term()}
+  def clear_exception(issue) do
+    with {:ok, directory} <- exception_directory() do
+      File.rm(Path.join(directory, workspace_key(issue) <> ".json"))
+    end
+  end
+
+  defp exception_directory do
+    root = Config.local_workspace_root()
+    directory = Path.join(root, ".symphony-exceptions")
+    with :ok <- validate_local_workspace_path(directory, root), do: {:ok, directory}
+  end
+
+  defp read_exceptions(directory, files) do
+    Enum.reduce_while(files, {:ok, []}, fn file, {:ok, entries} ->
+      path = Path.join(directory, file)
+
+      with :ok <- validate_local_workspace_path(path, directory),
+           {:ok, content} <- File.read(path),
+           {:ok, %{"id" => id, "identifier" => identifier, "reason" => reason} = entry} <- Jason.decode(content),
+           true <- is_binary(id) and is_binary(identifier) and is_binary(reason) do
+        {:cont, {:ok, [entry | entries]}}
+      else
+        error -> {:halt, {:error, {:pending_exception_unreadable, path, error}}}
+      end
+    end)
+  end
+
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do

@@ -960,7 +960,7 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(updated_state.retry_attempts, issue_id)
   end
 
-  test "retry releases its claim when dispatch revalidation no longer finds the issue" do
+  test "eligible retry releases its claim and rejoins normal dispatch revalidation" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1002,7 +1002,7 @@ defmodule SymphonyElixir.CoreTest do
 
       refute MapSet.member?(updated_state.claimed, issue_id)
       refute Map.has_key?(updated_state.running, issue_id)
-      refute Map.has_key?(updated_state.retry_attempts, issue_id)
+      assert %{attempt: 1} = updated_state.retry_attempts[issue_id]
     after
       File.rm_rf(test_root)
     end
@@ -1095,25 +1095,27 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    before_exit = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+    assert %{attempt: 0, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 0, 1_100)
+    assert due_at_ms >= before_exit + 1_000
+    assert due_at_ms <= System.monotonic_time(:millisecond) + 1_000
   end
 
-  test "a claimed retry consumes the sole ticket slot" do
+  test "a waiting retry releases the sole execution slot" do
     state = %Orchestrator.State{
       max_concurrent_agents: 1,
       running: %{},
       claimed: MapSet.new(["issue-resume"])
     }
 
-    assert Orchestrator.available_slots_for_test(state) == 0
+    assert Orchestrator.available_slots_for_test(state) == 1
   end
 
   test "a claimed retry may reuse its own reserved ticket slot" do
@@ -1259,7 +1261,7 @@ defmodule SymphonyElixir.CoreTest do
       tick_timer_ref: nil,
       tick_token: stale_tick_token,
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-      codex_rate_limits: nil
+      agent_rate_limits: nil
     }
 
     assert {:reply, %{queued: true, coalesced: false}, refreshed_state} =
@@ -1834,9 +1836,8 @@ defmodule SymphonyElixir.CoreTest do
         state: "In Progress"
       }
 
-      assert_raise RuntimeError, ~r/workspace_prepare_failed/, fn ->
-        AgentRunner.run(issue, nil, worker_host: "worker-a")
-      end
+      assert {:agent_failed, {:workspace_prepare_failed, "worker-a", 75, _}} =
+               catch_exit(AgentRunner.run(issue, nil, worker_host: "worker-a"))
 
       trace = File.read!(trace_file)
       assert trace =~ "worker-a bash -lc"

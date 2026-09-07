@@ -28,6 +28,13 @@ defmodule SymphonyElixirWeb.Router do
     live("/", DashboardLive, :index)
   end
 
+  # Registered before the observability catch-all so the MCP route is reachable.
+  scope "/", SymphonyElixirWeb do
+    post("/mcp", McpController, :rpc)
+    # Streamable-HTTP clients probe this for a server-to-client SSE channel.
+    get("/mcp", McpController, :stream)
+  end
+
   scope "/", SymphonyElixirWeb do
     get("/api/v1/state", ObservabilityApiController, :state)
 
