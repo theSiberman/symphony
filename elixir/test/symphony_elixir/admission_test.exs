@@ -26,6 +26,98 @@ defmodule SymphonyElixir.AdmissionTest do
     assert {:ok, [^issue]} = Tracker.fetch_issues_by_states(["Todo"])
   end
 
+  test "capacity is probed while work is running, so later work can still start", %{root: root} do
+    # The bug this pins: check_admission forced :unchecked whenever anything was
+    # running, and admission_available? demands :available, so maybe_dispatch
+    # short-circuited before choose_issues. With an admission_command set,
+    # Symphony could only admit while `running` was empty -- a hard cap of one
+    # concurrent agent no matter what max_concurrent_agents said, and silent,
+    # because the config read correctly and the dashboard just showed one agent.
+    #
+    # The second candidate must arrive in a LATER poll than the first. That is
+    # the production shape and the only one that discriminates: within a single
+    # cycle choose_issues fills every slot before anything is running, so both
+    # would dispatch even with the bug present.
+    marker = Path.join(root, "dispatched")
+    first = %Issue{id: "one", identifier: "ONE", title: "first", state: "Todo", dispatchable: true}
+    second = %Issue{id: "two", identifier: "TWO", title: "second", state: "Todo", dispatchable: true}
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [first])
+
+    configure("exit 0",
+      max_concurrent_agents: 2,
+      hook_after_create: "touch '#{marker}'-$SYMPHONY_ISSUE_IDENTIFIER; sleep 2; exit 1"
+    )
+
+    pid = start_supervised!({Orchestrator, name: AdmissionConcurrent})
+    send(pid, :run_poll_cycle)
+    eventually(fn -> File.exists?("#{marker}-ONE") end)
+    eventually(fn -> map_size(:sys.get_state(pid).running) == 1 end)
+
+    # The second becomes available with the first still in flight.
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [first, second])
+    send(pid, :run_poll_cycle)
+
+    eventually(fn -> File.exists?("#{marker}-TWO") end)
+    assert map_size(:sys.get_state(pid).running) == 2
+  end
+
+  test "a shortage discovered while running stops further admission", %{root: root} do
+    # The safety property the fix must not lose. Probing while busy is only
+    # correct if a NO is still obeyed; otherwise this trades a silent
+    # concurrency cap for a silent capacity breach.
+    capacity = Path.join(root, "capacity-ok")
+    File.write!(capacity, "yes")
+    marker = Path.join(root, "dispatched")
+    first = %Issue{id: "a", identifier: "A", title: "first", state: "Todo", dispatchable: true}
+    second = %Issue{id: "b", identifier: "B", title: "second", state: "Todo", dispatchable: true}
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [first])
+
+    configure("test -f '#{capacity}' || { echo disk-shortage; exit 75; }",
+      max_concurrent_agents: 2,
+      hook_after_create: "touch '#{marker}'-$SYMPHONY_ISSUE_IDENTIFIER; sleep 2; exit 1"
+    )
+
+    pid = start_supervised!({Orchestrator, name: AdmissionShortage})
+    send(pid, :run_poll_cycle)
+    eventually(fn -> File.exists?("#{marker}-A") end)
+
+    # The host fills up while work is in flight, and the approval goes stale.
+    File.rm!(capacity)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [first, second])
+    send(pid, :run_poll_cycle)
+
+    eventually(fn -> match?({:waiting, _}, :sys.get_state(pid).admission) end)
+    refute File.exists?("#{marker}-B")
+  end
+
+  test "an approval is consumed each cycle, so no dispatch rests on an old probe", %{root: root} do
+    # This is what makes probing-while-busy safe, and it predates the fix:
+    # maybe_dispatch consumes :available back to :idle at the end of every
+    # cycle, so the next cycle must probe again before selecting work. Without
+    # it, removing the running-count branch would have been worse than the bug
+    # -- one early yes would authorise every later dispatch and the host could
+    # fill while Symphony kept admitting against it.
+    probes = Path.join(root, "probes")
+    File.mkdir_p!(probes)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    configure("touch '#{probes}'/$$-$RANDOM")
+    pid = start_supervised!({Orchestrator, name: AdmissionFreshness})
+
+    send(pid, :run_poll_cycle)
+    eventually(fn -> length(File.ls!(probes)) >= 1 end)
+    eventually(fn -> :sys.get_state(pid).admission_task == nil end)
+    first_count = length(File.ls!(probes))
+
+    # The approval was spent by the cycle that used it.
+    assert :sys.get_state(pid).admission in [:idle, :available]
+
+    # So the following cycle probes again rather than reusing the old answer.
+    send(pid, :run_poll_cycle)
+    eventually(fn -> length(File.ls!(probes)) > first_count end)
+  end
+
   test "a successful old probe cannot authorize after reload", %{root: root} do
     started = Path.join(root, "started")
     worker = Path.join(root, "worker-started")

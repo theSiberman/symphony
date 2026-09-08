@@ -442,9 +442,21 @@ defmodule SymphonyElixir.Orchestrator do
       command == nil ->
         %{state | admission: :available, admission_command: nil}
 
-      map_size(state.running) > 0 ->
-        %{state | admission: :unchecked}
-
+      # There is deliberately no "running agents" branch here. There used to be
+      # one, forcing :unchecked whenever anything was running -- and since
+      # admission_available? demands :available, maybe_dispatch then
+      # short-circuited before choose_issues. With an admission_command set,
+      # Symphony could admit new work only while `running` was empty: a hard cap
+      # of one concurrent agent whatever max_concurrent_agents said, and a
+      # silent one, because the config read correctly and the dashboard simply
+      # showed a single agent.
+      #
+      # Probing while busy is safe here because the probe measures HOST capacity
+      # (disk), which is perfectly measurable with work in flight, and because
+      # an approval is single-use: maybe_dispatch consumes :available back to
+      # :idle at the end of every cycle, so each dispatch decision already rests
+      # on a probe from that same cycle. That consumption is what makes a
+      # separate freshness timer unnecessary.
       state.admission == :available and state.admission_command == command ->
         state
 
