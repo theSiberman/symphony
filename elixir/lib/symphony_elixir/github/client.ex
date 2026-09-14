@@ -103,7 +103,12 @@ defmodule SymphonyElixir.GitHub.Client do
          %{provider: %{"state_source" => "labels"}},
          request_fun
        ) do
-    fetch_label_state_pages(state_names, settings, request_fun)
+    {native_states, label_states} = Enum.split_with(state_names, &(&1 == "closed"))
+
+    with {:ok, closed} <- fetch_closed_pages(native_states, settings, request_fun),
+         {:ok, labelled} <- fetch_label_state_pages(label_states, settings, request_fun) do
+      {:ok, Enum.uniq_by(closed ++ labelled, & &1.id)}
+    end
   end
 
   defp fetch_states_with_settings(_state_names, states, settings, _tracker_settings, request_fun) do
@@ -111,6 +116,12 @@ defmodule SymphonyElixir.GitHub.Client do
       nil -> {:ok, []}
       query -> do_fetch_pages(settings, query, states, 1, request_fun, [])
     end
+  end
+
+  defp fetch_closed_pages([], _settings, _request_fun), do: {:ok, []}
+
+  defp fetch_closed_pages(states, settings, request_fun) do
+    do_fetch_pages(settings, "closed", MapSet.new(states), 1, request_fun, [])
   end
 
   defp fetch_label_state_pages(states, settings, request_fun) do

@@ -783,7 +783,12 @@ Original sorting rank (stable intent):
 
 At each poll, an active, required-labelled issue with `priority_inheritable=true`
 propagates its original rank to its open blockers transitively. Each issue sorts by
-the best rank reaching it, then its own original rank for deterministic ties. Only
+the best priority reaching it. A blocker that inherits a better rank retains precedence
+over unrelated work at that priority. Within the remaining effective-priority group,
+validated preserved local workspaces sort first, followed by due retries (recorded
+checkpoints before unrecorded retries, then oldest due time), then effective
+creation time, identifier, and the issue's own original rank for deterministic ties.
+A retry whose backoff is not due remains ineligible. Only
 issues present in the candidate snapshot participate: missing dependencies are not
 automatically fetched or admitted. Terminal edges/targets, paused issues and adapter-excluded
 issues do not relay rank. Resolve a blocker by identifier when supplied, otherwise
@@ -1165,6 +1170,11 @@ Timeouts:
 - `codex.turn_timeout_ms`: maximum silence interval while a turn stream is active; each
   app-server output resets it, so it is not a total turn runtime cap
 - `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
+- Fork OpenCode adapter: `opencode.turn_timeout_ms` is a whole-turn budget because
+  its request is synchronous. The adapter emits `turn_budget_exhausted`; the
+  orchestrator persists an actionable exception and holds the issue immediately,
+  without an automatic retry. Tracker outages retain that hold across restart.
+  The originating budget classification survives runtime configuration reload.
 
 Error mapping (RECOMMENDED normalized categories):
 
@@ -2139,7 +2149,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
-- Dispatch sort order inherits the best priority/creation rank through open dependencies
+- Dispatch sort order inherits the best priority through open dependencies and preserves blocker
+  precedence, then prefers validated preserved local workspaces and oldest-due recorded retries before
+  creation time
 - `dispatchable=false` issues are not eligible
 - Required-label filtering is case-insensitive and applies after adapter normalization
 - Active-state issue refresh updates running entry state
@@ -2352,11 +2364,22 @@ Before changing ownership scope, operators must reconcile the old scope while id
 ### Host admission and retry eligibility (Elixir extension)
 
 An optional `agent.admission_command` provides a bounded asynchronous host check
-before idle dispatch. Nonzero exit, missing results and results from replaced
+after eligible candidate selection. `SYMPHONY_ADMISSION_CONTEXT` carries JSON version 1,
+scheduler OS PID, candidate identifier/workspace, running workspaces and worker hosts.
+Approval is bound to this context and workspace identity, refreshed for each dispatch,
+and consumed once. Empty/full queues still reconcile storage without dispatching.
+Nonzero exit, missing results and results from replaced
 configuration are waiting states. The scheduler continues reconciliation, exposes
 the waiting reason, and rechecks on its normal poll. The command's host process
 group is bounded by GNU timeout (90 seconds, five-second forced-kill allowance).
-The deployment owns process-safe idle cleanup; the scheduler owns admission.
+The deployment owns locked durable storage reservations and runtime cleanup; the
+scheduler owns selection and one-use admission. Local workspace removal failures
+remain in `.symphony-cleanup` and retry only after positive current terminal-state
+confirmation. Absent, reopened, blocked and otherwise ineligible open issues keep
+their source. Provisioning identity is explicit `.scratch/ownership.json` bound
+to workspace, identifier, Git directory, integration commit/branch and required
+provisioning artifacts. The integration commit must remain an ancestor of HEAD. Dirty
+source does not invalidate it; legacy/partial workspaces receive no resume priority.
 
 Backoff entries preserve attempt and preferred-worker metadata but do not reserve
 execution slots. Due retries rejoin ordinary sorted selection and pass the same

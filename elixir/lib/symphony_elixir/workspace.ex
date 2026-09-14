@@ -4,11 +4,82 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, IntegrationTarget, PathSafety, SSH}
+  alias SymphonyElixir.{Config, IntegrationTarget, PathSafety, SSH, Tracker}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
   @type worker_host :: String.t() | nil
+
+  @doc "Validated completed provisioning identity; dirty source is permitted."
+  @spec resume_identity(map()) :: map() | nil
+  def resume_identity(issue) do
+    workspace = Path.join(Config.local_workspace_root(), workspace_key(issue))
+    marker = Path.join(workspace, ".scratch/ownership.json")
+
+    with {:ok, canonical} <- PathSafety.canonicalize(marker),
+         true <- canonical == marker,
+         {:ok, content} <- File.read(marker),
+         {:ok, %{"version" => 1, "workspace" => ^workspace, "identifier" => identifier, "git_dir" => git_dir} = identity} <- Jason.decode(content),
+         true <- identifier == issue.identifier,
+         true <- valid_provisioning?(workspace, identity),
+         {actual, 0} <- System.cmd("git", ["-C", workspace, "rev-parse", "--absolute-git-dir"], stderr_to_stdout: true),
+         true <- String.trim(actual) == git_dir,
+         {:ok, %{uid: uid}} <- File.stat(Config.local_workspace_root()),
+         {:ok, %{uid: ^uid}} <- File.stat(marker),
+         {:ok, %{uid: ^uid} = stat} <- File.stat(workspace) do
+      %{
+        workspace: workspace,
+        git_dir: git_dir,
+        inode: stat.inode,
+        provisioning_hash: :crypto.hash(:sha256, content) |> Base.encode16(),
+        target_inode: target_inode(Path.join(workspace, "target"))
+      }
+    else
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp valid_provisioning?(workspace, identity) do
+    with %{"branch" => branch, "integration_branch" => integration_branch, "integration_commit" => commit, "required_paths" => [_ | _] = paths} <- identity,
+         true <- Enum.all?([branch, integration_branch, commit], &(is_binary(&1) and &1 != "")),
+         true <- Enum.all?(paths, &provisioning_artifact?(workspace, &1, get_in(identity, ["required_types", &1]))),
+         {actual_branch, 0} <- System.cmd("git", ["-C", workspace, "branch", "--show-current"]),
+         true <- String.trim(actual_branch) == branch,
+         {actual_integration, 0} <- System.cmd("git", ["-C", workspace, "config", "--local", "symphony.integrationBranch"]),
+         true <- String.trim(actual_integration) == integration_branch,
+         {actual_commit, 0} <- System.cmd("git", ["-C", workspace, "config", "--local", "symphony.integrationCommit"]),
+         {_, 0} <- System.cmd("git", ["-C", workspace, "merge-base", "--is-ancestor", commit, String.trim(actual_commit)], stderr_to_stdout: true),
+         {_, 0} <- System.cmd("git", ["-C", workspace, "merge-base", "--is-ancestor", commit, "HEAD"], stderr_to_stdout: true) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp provisioning_artifact?(workspace, relative, expected_type) when is_binary(relative) do
+    path = Path.join(workspace, relative)
+
+    with true <- relative != "" and Path.type(relative) == :relative and ".." not in Path.split(relative),
+         {:ok, ^path} <- PathSafety.canonicalize(path),
+         {:ok, %{uid: uid}} <- File.stat(workspace),
+         {:ok, %{uid: ^uid, type: type}} <- File.stat(path),
+         true <- {expected_type, type} in [{"file", :regular}, {"directory", :directory}] do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp provisioning_artifact?(_, _, _), do: false
+
+  defp target_inode(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :directory, inode: inode}} -> inode
+      _ -> nil
+    end
+  end
 
   # These markers exist only while an exhausted-worker hold is being written to
   # the tracker. They also cover failures before a ticket checkout exists.
@@ -210,8 +281,242 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp remove_local_workspace(workspace) do
-    maybe_run_before_remove_hook(workspace, nil)
-    File.rm_rf(workspace)
+    result =
+      case maybe_run_before_remove_hook(workspace, nil) do
+        :ok -> File.rm_rf(workspace)
+        {:error, reason} -> {:error, reason, workspace}
+      end
+
+    case result do
+      {:ok, _} ->
+        File.rm(cleanup_record_path(workspace))
+
+      {:error, reason, _} ->
+        persist_cleanup(workspace, reason)
+        Logger.warning("Workspace cleanup pending workspace=#{workspace} reason=#{inspect(reason)}")
+    end
+
+    result
+  end
+
+  defp persist_cleanup(workspace, reason) do
+    path = cleanup_record_path(workspace)
+    temporary = path <> ".new"
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         {:ok, canonical} <- PathSafety.canonicalize(temporary),
+         true <- canonical == temporary,
+         :ok <- File.write(temporary, Jason.encode!(%{workspace: workspace, error: inspect(reason)}), [:sync]),
+         :ok <- File.rename(temporary, path) do
+      :ok
+    else
+      error -> Logger.error("Unable to persist workspace cleanup workspace=#{workspace} reason=#{inspect(error)}")
+    end
+  end
+
+  @doc "Retry failed removals only after positive current terminal-state confirmation."
+  @spec reconcile_cleanup() :: :ok
+  def reconcile_cleanup do
+    records = Config.local_workspace_root() |> Path.join(".symphony-cleanup/*.json") |> Path.wildcard()
+
+    if records != [] do
+      states = Config.settings!().tracker.terminal_states
+
+      case Tracker.fetch_issues_by_states(states) do
+        {:ok, issues} ->
+          terminal_states = MapSet.new(states, &String.downcase/1)
+
+          terminal =
+            issues
+            |> Enum.filter(&MapSet.member?(terminal_states, String.downcase(&1.state)))
+            |> MapSet.new(&Path.join(Config.local_workspace_root(), workspace_key(&1)))
+
+          Enum.each(records, &retry_cleanup(&1, terminal))
+
+        {:error, reason} ->
+          Logger.warning("Preserving pending workspace cleanup reason=#{inspect(reason)}")
+      end
+    end
+
+    :ok
+  end
+
+  @doc "Discovers terminal workspaces left behind after a ticket left the scheduler queue."
+  @spec reconcile_terminal_workspaces([map()]) :: :ok
+  def reconcile_terminal_workspaces(active_issues \\ []) when is_list(active_issues) do
+    terminal_states = Config.settings!().tracker.terminal_states
+    active_workspaces = MapSet.new(active_issues, &workspace_path_for_issue_key/1)
+
+    case Tracker.fetch_issues_by_states(terminal_states) do
+      {:ok, issues} ->
+        terminal_state_set = MapSet.new(terminal_states, &String.downcase/1)
+
+        issues
+        |> Enum.filter(&terminal_issue?(&1, terminal_state_set))
+        |> Enum.reject(&MapSet.member?(active_workspaces, workspace_path_for_issue_key(&1)))
+        |> Enum.each(&remove_clean_terminal_workspace/1)
+
+      {:error, reason} ->
+        Logger.warning("Skipping terminal workspace reconciliation; failed to fetch terminal issues: #{inspect(reason)}")
+    end
+
+    :ok
+  end
+
+  defp terminal_issue?(%{state: state}, terminal_states) when is_binary(state),
+    do: MapSet.member?(terminal_states, String.downcase(state))
+
+  defp terminal_issue?(_, _terminal_states), do: false
+
+  defp workspace_path_for_issue_key(%{identifier: identifier}) when is_binary(identifier) do
+    Path.join(Config.local_workspace_root(), workspace_key(identifier))
+  end
+
+  defp workspace_path_for_issue_key(_issue), do: nil
+
+  # Periodic discovery has no worker lifecycle to establish ownership of a
+  # workspace. Delete only work whose branch is reachable and fully pushed;
+  # tracked or untracked source changes, malformed checkouts, and failed checks
+  # are preserved for an operator to inspect. Only the known generated roots
+  # target, node_modules, .scratch, and terminal .context output are disposable.
+  defp remove_clean_terminal_workspace(%{identifier: identifier} = issue) when is_binary(identifier) do
+    case Config.settings!().worker.ssh_hosts do
+      [] -> remove_clean_local_terminal_workspace(issue)
+      worker_hosts -> remove_clean_remote_terminal_workspaces(issue, worker_hosts)
+    end
+  end
+
+  defp remove_clean_terminal_workspace(_issue), do: :ok
+
+  defp remove_clean_local_terminal_workspace(issue) do
+    workspace = workspace_path_for_issue_key(issue)
+    # Historical terminal issues normally have no checkout. Avoid a bounded
+    # `git -C` timeout and a misleading preservation log for each absent path.
+    if File.exists?(workspace) and clean_git_workspace?(workspace), do: remove(workspace)
+  end
+
+  defp remove_clean_remote_terminal_workspaces(issue, worker_hosts) do
+    Enum.each(worker_hosts, fn worker_host ->
+      with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue), worker_host),
+           true <- clean_remote_git_workspace?(workspace, worker_host) do
+        remove(workspace, worker_host)
+      else
+        _ -> :ok
+      end
+    end)
+  end
+
+  defp clean_git_workspace?(workspace) when is_binary(workspace) do
+    case run_git(workspace, ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"]) do
+      {status, 0} -> clean_published_git_workspace?(workspace, status)
+      _ -> preserve_terminal_workspace(workspace, :git_status_failed)
+    end
+  rescue
+    _ -> preserve_terminal_workspace(workspace, :git_status_failed)
+  end
+
+  defp clean_published_git_workspace?(workspace, status) do
+    with :ok <- disposable_workspace_status?(status),
+         {branch, 0} when branch != "" <- run_git(workspace, ["symbolic-ref", "--quiet", "--short", "HEAD"]),
+         {head, 0} <- run_git(workspace, ["rev-parse", "HEAD"]),
+         {remote_head, 0} <- run_git(workspace, ["ls-remote", "--exit-code", "origin", "refs/heads/#{branch}"]),
+         true <- remote_branch_head?(remote_head, head) do
+      true
+    else
+      :source_changes -> preserve_terminal_workspace(workspace, :source_changes)
+      {:unknown_ignored_path, path} -> preserve_terminal_workspace(workspace, {:unknown_ignored_path, path})
+      _ -> preserve_terminal_workspace(workspace, :unpublished_or_remote_unreachable)
+    end
+  end
+
+  defp disposable_workspace_status?(""), do: :ok
+
+  defp disposable_workspace_status?(status) do
+    status
+    |> String.split("\n", trim: true)
+    |> Enum.reduce_while(:ok, fn
+      "!! " <> ignored_path, :ok ->
+        if disposable_ignored_path?(ignored_path),
+          do: {:cont, :ok},
+          else: {:halt, {:unknown_ignored_path, ignored_path}}
+
+      generated_latest_json, :ok ->
+        if generated_latest_json?(generated_latest_json),
+          do: {:cont, :ok},
+          else: {:halt, :source_changes}
+    end)
+  end
+
+  defp disposable_ignored_path?(path) do
+    case Path.split(path) do
+      [".gsd", "test-runs" | _] -> true
+      [root | _] -> root in ["target", "node_modules", ".scratch", ".context"]
+      [] -> false
+    end
+  end
+
+  defp generated_latest_json?(<<index, worktree, " ", ".gsd/test-runs/latest.json">>) do
+    index in [?\s, ?M] and worktree in [?\s, ?M] and {index, worktree} != {?\s, ?\s}
+  end
+
+  defp generated_latest_json?(_status), do: false
+
+  defp preserve_terminal_workspace(workspace, reason) do
+    Logger.info("Preserving terminal workspace workspace=#{workspace} reason=#{inspect(reason)}")
+    false
+  end
+
+  defp run_git(workspace, arguments) do
+    case System.cmd("timeout", ["--kill-after=1s", "15s", "git", "-C", workspace | arguments], stderr_to_stdout: true) do
+      {output, status} -> {String.trim_trailing(output), status}
+    end
+  end
+
+  defp remote_branch_head?(remote_head, head) do
+    case String.split(remote_head, ~r/\s+/, trim: true) do
+      [^head, _ref] -> true
+      _ -> false
+    end
+  end
+
+  defp clean_remote_git_workspace?(workspace, worker_host) do
+    script =
+      [
+        remote_shell_assign("workspace", workspace),
+        "status=$(git -C \"$workspace\" status --porcelain=v1 --untracked-files=all --ignored=matching) || exit 1",
+        "if printf '%s\\n' \"$status\" | grep -Ev '^!! (target|node_modules|\\.scratch|\\.context)(/|$)' | grep -q .; then exit 1; fi",
+        "branch=$(git -C \"$workspace\" symbolic-ref --quiet --short HEAD) || exit 1",
+        "head=$(git -C \"$workspace\" rev-parse HEAD) || exit 1",
+        "remote=$(git -C \"$workspace\" ls-remote --exit-code origin \"refs/heads/$branch\") || exit 1",
+        "test \"${remote%%[[:space:]]*}\" = \"$head\""
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {"", 0}} -> true
+      _ -> false
+    end
+  end
+
+  defp retry_cleanup(path, terminal) do
+    with {:ok, canonical} <- PathSafety.canonicalize(path),
+         true <- canonical == path,
+         {:ok, content} <- File.read(path),
+         {:ok, %{"workspace" => workspace}} <- Jason.decode(content),
+         true <- path == cleanup_record_path(workspace),
+         true <- MapSet.member?(terminal, workspace) do
+      case remove(workspace) do
+        {:ok, _} -> File.rm(path)
+        _ -> :ok
+      end
+    else
+      reason -> Logger.warning("Preserving pending workspace cleanup record=#{path} reason=#{inspect(reason)}")
+    end
+  end
+
+  defp cleanup_record_path(workspace) do
+    key = :crypto.hash(:sha256, workspace) |> Base.encode16(case: :lower)
+    Path.join([Config.local_workspace_root(), ".symphony-cleanup", key <> ".json"])
   end
 
   @spec remove_issue_workspaces(term()) :: :ok
@@ -360,7 +665,7 @@ defmodule SymphonyElixir.Workspace do
   defp cleanup_failed_new_workspace(_workspace, false, _worker_host), do: :ok
 
   defp cleanup_failed_new_workspace(workspace, true, nil) do
-    case File.rm_rf(workspace) do
+    case remove_local_workspace(workspace) do
       {:ok, _removed} ->
         :ok
 
@@ -398,7 +703,6 @@ defmodule SymphonyElixir.Workspace do
               "before_remove",
               nil
             )
-            |> ignore_hook_failure()
         end
 
       false ->
@@ -440,7 +744,6 @@ defmodule SymphonyElixir.Workspace do
           {:error, reason} ->
             {:error, reason}
         end
-        |> ignore_hook_failure()
     end
   end
 
@@ -662,6 +965,7 @@ defmodule SymphonyElixir.Workspace do
     integration_branch = Map.get(issue_context, :integration_branch, "main")
 
     [
+      {"SYMPHONY_OWNER_PID", System.pid()},
       {"SYMPHONY_ISSUE_ID", issue_id || ""},
       {"SYMPHONY_ISSUE_IDENTIFIER", issue_identifier || "issue"},
       {"SYMPHONY_ISSUE_PARENT_NUMBER", if(is_integer(parent_number), do: Integer.to_string(parent_number), else: "")},

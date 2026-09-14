@@ -48,7 +48,7 @@ defmodule SymphonyElixir.GitHub.Adapter do
         Enum.map(settings.required_labels, fn label -> {"DELETE", path <> "/labels/" <> URI.encode(label, &URI.char_unreserved?/1), nil} end) ++
         [
           {"POST", path <> "/comments",
-           %{"body" => "Symphony preserved this candidate after repeated worker failures. #{reason}. Inspect the preserved workspace and worker logs, then restore queue membership when resolved."}}
+           %{"body" => "Symphony preserved this candidate after a worker failure. #{reason}. Inspect the preserved workspace and worker logs, then restore queue membership when resolved."}}
         ]
 
     Enum.reduce_while(operations, :ok, fn {method, endpoint, body}, :ok ->

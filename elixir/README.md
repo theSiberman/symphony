@@ -7,20 +7,23 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 > Symphony Elixir is prototype software intended for evaluation only and is presented as-is.
 > We recommend implementing your own hardened version based on `SPEC.md`.
 
-The dispatch queue defaults to priority, then oldest first. A newer blocker inherits
+The dispatch queue defaults to priority, then prefers validated preserved local
+workspaces, due retries, and finally the oldest issue. A newer blocker inherits
 the best queue position of the active tickets waiting on it, including through
 dependency chains. Ranking is recalculated each poll without interrupting running
 workers or admitting paused, excluded or still-blocked tickets.
 
 Host admission can be configured with `agent.admission_command`. It runs once
-asynchronously before an idle dispatch decision, bounded to 90 seconds (plus a
+asynchronously after candidate selection, bounded to 90 seconds (plus a
 five-second process-group kill allowance, using the host `timeout` command).
 Exit zero admits work; missing executables, failures and stale results mean host
 waiting. Polling/reconciliation remain responsive; labels and retry counts are
 unchanged by host waiting. The snapshot/API exposes `admission.status` and `reason`.
 
-Retries rejoin the ordinary dependency/priority selection when their backoff is
-due. Only running workers consume execution slots. Normal continuation resets the
+Retries become eligible only when their backoff is due and are preferred within
+the same effective priority after preserved workspaces. The oldest due checkpoint runs first, so another retry
+gets the next slot instead of being starved by a continuation. Only running workers
+consume execution slots. Normal continuation resets the
 abnormal-failure count; `agent.max_abnormal_retries` defaults to three. Exhaustion
 preserves work and records a pending exception under the workspace root before
 asking the tracker to hold the issue. GitHub uses `needs-info` and removes queue
@@ -53,6 +56,9 @@ the Codex child, so the agent does not need a second tracker login.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
+Every five minutes Symphony also discovers terminal workspaces left behind after a ticket was withdrawn from the
+queue. That reconciliation removes clean Git worktrees and the generated verification output under
+`.gsd/test-runs`; other dirty, malformed, or unreadable workspaces are preserved for inspection.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
@@ -179,6 +185,20 @@ Notes:
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
   app-server update resets it; it is not a total turn runtime cap.
+- `opencode.turn_timeout_ms` bounds the entire synchronous turn, including tool
+  execution. Expiry creates a durable actionable exception immediately, bypassing
+  abnormal retries. It preserves the workspace and uses the existing tracker hold
+  and restart-replay mechanism. Set it to `0` to disable the turn-wide deadline.
+  OpenCode emits no intermediate progress here;
+  tool-process idle supervision belongs to the configured test runner.
+- Successful OpenCode HTTP responses must match their endpoint's response shape:
+  objects for sessions and MCP registration; booleans for abort and permission
+  acknowledgements; objects or booleans for health probes. A message must carry
+  an assistant result in its standard `info` wrapper, a supported legacy
+  `message` wrapper, or directly; an explicit assistant error is also valid.
+  Empty or malformed message wrappers return an `opencode_response_malformed`
+  error. Failed or malformed turns do not emit a successful `turn_completed`
+  event.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
@@ -446,3 +466,14 @@ you.
 ## License
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
+
+Storage admission commands receive `SYMPHONY_ADMISSION_CONTEXT` JSON (version 1)
+with `owner_pid`, `candidate`, `running`, `identity`, and `workers`. A candidate or
+running entry contains `identifier` and absolute `workspace`. Commands must reserve
+capacity atomically before returning zero and reconcile abandoned reservations.
+The approval cannot be transferred to another candidate or running set.
+
+For an owned per-workspace OpenCode service, set `opencode.workspace_runtime: true`.
+The before-run hook must write `.scratch/opencode.json` containing version 1,
+workspace, loopback `base_url`, and password. The adapter fails closed if absent.
+The deployment must stop the service cgroup and confirm exit before deleting temp.

@@ -29,10 +29,15 @@ hooks:
     cd elixir && mise exec -- mix workspace.before_remove
 agent:
   # Optional host admission; requires GNU timeout on the scheduler host.
+  # Receives SYMPHONY_ADMISSION_CONTEXT with candidate/running workspace identities.
   # admission_command: /deployment/bin/check-capacity
   max_abnormal_retries: 3
   max_concurrent_agents: 10
   max_turns: 20
+# With agent.runtime: opencode and deployment-owned per-workspace services:
+# opencode:
+#   workspace_runtime: true # requires .scratch/opencode.json from before_run
+# Configure after_run and before_remove hooks to confirm service teardown.
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
@@ -334,3 +339,6 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 The scheduler preserves exhausted-worker holds under the workspace root until
 the tracker confirms them, replaying pending holds before dispatch after restart.
 Temporary provider or tracker errors back off without spending abnormal attempts.
+OpenCode's whole-turn budget exhaustion creates that hold immediately rather than
+spending further abnormal retries; configure its ceiling separately from tool
+inactivity limits. Resolve the exception before restoring queue eligibility.

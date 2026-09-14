@@ -2,7 +2,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   use SymphonyElixir.TestSupport
   alias Ecto.Changeset
   alias SymphonyElixir.Config.Schema
-  alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
+  alias SymphonyElixir.Config.Schema.{Codex, Opencode, StringOrMap}
   alias SymphonyElixir.Linear.Client
 
   test "workspace bootstrap can be implemented in after_create hook" do
@@ -412,6 +412,112 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert :ok = Workspace.remove_issue_workspaces("S-2")
   end
 
+  test "periodic terminal reconciliation removes generated verification output but preserves unknown work" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-terminal-reconcile-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    origin = Path.join(test_root, "origin.git")
+    issue = %Issue{id: "terminal-clean", identifier: "MT-TERMINAL-CLEAN", state: "Done"}
+    workspace = Path.join(workspace_root, Workspace.workspace_key(issue))
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, tracker_kind: "memory")
+      File.mkdir_p!(workspace)
+      {_, 0} = System.cmd("git", ["init", "-q", workspace])
+      File.write!(Path.join(workspace, "README.md"), "clean workspace")
+      File.write!(Path.join(workspace, ".gitignore"), "node_modules/\ntarget/\n.scratch/\n.context/\n.env\n.gsd/test-runs/history/\n")
+      File.mkdir_p!(Path.join(workspace, ".gsd/test-runs"))
+      File.write!(Path.join(workspace, ".gsd/test-runs/latest.json"), "{\"result\":\"initial\"}")
+      {_, 0} = System.cmd("git", ["-C", workspace, "add", "README.md", ".gitignore", ".gsd/test-runs/latest.json"])
+      {_, 0} = System.cmd("git", ["-C", workspace, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "initial"])
+      {_, 0} = System.cmd("git", ["init", "--bare", "-q", origin])
+      {_, 0} = System.cmd("git", ["-C", workspace, "remote", "add", "origin", origin])
+      {_, 0} = System.cmd("git", ["-C", workspace, "push", "-qu", "--set-upstream", "origin", "HEAD"])
+      File.mkdir_p!(Path.join(workspace, "node_modules/package"))
+      File.mkdir_p!(Path.join(workspace, "target/debug"))
+      File.mkdir_p!(Path.join(workspace, ".scratch/run-123"))
+      File.mkdir_p!(Path.join(workspace, ".context"))
+      File.write!(Path.join(workspace, "target/debug/build.log"), "generated")
+      File.mkdir_p!(Path.join(workspace, ".gsd/test-runs/history"))
+      File.write!(Path.join(workspace, ".gsd/test-runs/history/verification.log"), "generated history")
+      File.write!(Path.join(workspace, ".env"), "operator secret")
+      File.write!(Path.join(workspace, ".gsd/test-runs/latest.json"), "{\"result\":\"verified\"}")
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      protected_state = %Orchestrator.State{running: %{issue.id => %{identifier: issue.identifier}}}
+      _updated_state = Orchestrator.reconcile_terminal_workspaces_for_test(protected_state, [])
+      assert File.exists?(workspace)
+
+      unknown_log = capture_log(fn -> assert :ok = Workspace.reconcile_terminal_workspaces() end)
+      assert unknown_log =~ "unknown_ignored_path"
+      assert File.exists?(workspace)
+      File.rm!(Path.join(workspace, ".env"))
+      clean_log = capture_log(fn -> assert :ok = Workspace.reconcile_terminal_workspaces() end)
+      assert clean_log == ""
+      refute File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "periodic terminal reconciliation preserves dirty and reopened workspaces" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-terminal-preserve-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    terminal = %Issue{id: "terminal-dirty", identifier: "MT-TERMINAL-DIRTY", state: "Done"}
+    unpublished = %Issue{id: "terminal-unpublished", identifier: "MT-TERMINAL-UNPUBLISHED", state: "Done"}
+    reopened_terminal = %Issue{id: "terminal-reopened", identifier: "MT-TERMINAL-REOPENED", state: "Done"}
+    reopened_active = %{reopened_terminal | state: "Todo", dispatchable: true}
+    dirty_workspace = Path.join(workspace_root, Workspace.workspace_key(terminal))
+    unpublished_workspace = Path.join(workspace_root, Workspace.workspace_key(unpublished))
+    reopened_workspace = Path.join(workspace_root, Workspace.workspace_key(reopened_terminal))
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, tracker_kind: "memory")
+
+      for workspace <- [dirty_workspace, unpublished_workspace, reopened_workspace] do
+        File.mkdir_p!(workspace)
+        {_, 0} = System.cmd("git", ["init", "-q", workspace])
+        File.write!(Path.join(workspace, "README.md"), "tracked")
+        {_, 0} = System.cmd("git", ["-C", workspace, "add", "README.md"])
+        {_, 0} = System.cmd("git", ["-C", workspace, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "initial"])
+      end
+
+      File.write!(Path.join(dirty_workspace, "unpublished.rs"), "preserve me")
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [terminal, unpublished, reopened_terminal])
+
+      assert :ok = Workspace.reconcile_terminal_workspaces([reopened_active])
+      assert File.exists?(dirty_workspace)
+      assert File.read!(Path.join(dirty_workspace, "unpublished.rs")) == "preserve me"
+      assert File.exists?(unpublished_workspace)
+      assert File.exists?(reopened_workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "periodic terminal reconciliation skips missing historical workspaces before Git status" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-terminal-absent-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, tracker_kind: "memory")
+
+      issues =
+        for number <- 1..400 do
+          %Issue{id: "terminal-absent-#{number}", identifier: "MT-ABSENT-#{number}", state: "Done"}
+        end
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, issues)
+      started = System.monotonic_time(:millisecond)
+      log = capture_log(fn -> assert :ok = Workspace.reconcile_terminal_workspaces() end)
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      assert log == ""
+      assert elapsed < 1_000, "missing workspaces must not run one Git status probe per terminal issue"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace cleanup ignores non-binary identifier" do
     assert :ok = Workspace.remove_issue_workspaces(nil)
   end
@@ -718,6 +824,78 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Enum.map(sorted, & &1.identifier) == ["MT-200", "MT-201", "MT-199"]
   end
 
+  test "orchestrator prefers a preserved workspace within the same priority" do
+    fresh = %Issue{
+      id: "fresh",
+      identifier: "GH-100",
+      title: "Older fresh work",
+      state: "Todo",
+      priority: 1,
+      created_at: ~U[2026-01-01 00:00:00Z]
+    }
+
+    preserved = %Issue{
+      id: "preserved",
+      identifier: "GH-101",
+      title: "Newer preserved work",
+      state: "Todo",
+      priority: 1,
+      created_at: ~U[2026-01-02 00:00:00Z]
+    }
+
+    lower_priority_preserved = %{preserved | id: "low", identifier: "GH-102", priority: 2}
+    preserved? = &(&1.identifier in ["GH-101", "GH-102"])
+
+    sorted =
+      Orchestrator.sort_issues_for_dispatch_for_test(
+        [fresh, lower_priority_preserved, preserved],
+        preserved?
+      )
+
+    assert Enum.map(sorted, & &1.identifier) == ["GH-101", "GH-100", "GH-102"]
+  end
+
+  test "dependency priority uses the blocker's own workspace preservation" do
+    dependent = %Issue{
+      id: "dependent",
+      identifier: "GH-103",
+      title: "Preserved dependent",
+      state: "Todo",
+      priority: 1,
+      dispatchable: false,
+      blocked_by: [%{id: "blocker", identifier: "GH-104", state: "Todo"}],
+      created_at: ~U[2026-01-02 00:00:00Z]
+    }
+
+    blocker = %Issue{
+      id: "blocker",
+      identifier: "GH-104",
+      title: "Preserved blocker",
+      state: "Todo",
+      created_at: ~U[2026-01-03 00:00:00Z]
+    }
+
+    unrelated = %Issue{
+      id: "unrelated",
+      identifier: "GH-105",
+      title: "Fresh unrelated work",
+      state: "Todo",
+      priority: 1,
+      created_at: ~U[2026-01-01 00:00:00Z]
+    }
+
+    sort = fn preserved ->
+      Orchestrator.sort_issues_for_dispatch_for_test(
+        [unrelated, blocker, dependent],
+        &(&1.identifier in preserved)
+      )
+      |> Enum.map(& &1.identifier)
+    end
+
+    assert sort.(["GH-104"]) == ["GH-103", "GH-104", "GH-105"]
+    assert sort.(["GH-103", "GH-105"]) == ["GH-103", "GH-104", "GH-105"]
+  end
+
   test "provider-marked blocked issue is not dispatch-eligible" do
     state = %Orchestrator.State{
       max_concurrent_agents: 3,
@@ -911,7 +1089,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "workspace remove continues when before_remove hook fails" do
+  test "workspace removal stays pending when before_remove hook fails" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -930,13 +1108,24 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-FAIL")
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-FAIL")
+      assert File.exists?(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+      assert :ok = Workspace.reconcile_cleanup()
+      assert File.exists?(workspace)
+      reopened = %Issue{id: "cleanup", identifier: "MT-HOOKS-FAIL", state: "needs-info", dispatchable: false}
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [reopened])
+      assert :ok = Workspace.reconcile_cleanup()
+      assert File.exists?(workspace)
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [%Issue{id: "cleanup", identifier: "MT-HOOKS-FAIL", state: "Done"}])
+      assert :ok = Workspace.reconcile_cleanup()
       refute File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook fails with large output" do
+  test "workspace removal stays pending when before_remove hook fails with large output" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -955,13 +1144,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-LARGE-FAIL")
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-LARGE-FAIL")
+      assert File.exists?(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [%Issue{id: "cleanup", identifier: "MT-HOOKS-LARGE-FAIL", state: "Done"}])
+      assert :ok = Workspace.reconcile_cleanup()
       refute File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook times out" do
+  test "workspace removal stays pending when before_remove hook times out" do
     previous_timeout = Application.get_env(:symphony_elixir, :workspace_hook_timeout_ms)
 
     on_exit(fn ->
@@ -987,11 +1180,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
+        hook_timeout_ms: 10,
         hook_before_remove: "sleep 1"
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-TIMEOUT")
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-TIMEOUT")
+      assert File.exists?(workspace)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [%Issue{id: "cleanup", identifier: "MT-HOOKS-TIMEOUT", state: "Done"}])
+      assert :ok = Workspace.reconcile_cleanup()
       refute File.exists?(workspace)
     after
       File.rm_rf(test_root)
@@ -1378,6 +1576,24 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert whitespace_state_changeset.errors == [
              limits: {"state names must not be blank", []}
            ]
+  end
+
+  test "opencode schema preserves defaults and rejects an invalid startup timeout" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               tracker: %{kind: "memory"},
+               opencode: %{model: "openai/gpt-5.5", startup_timeout_ms: 5_000}
+             })
+
+    assert %Opencode{command: "opencode serve", startup_timeout_ms: 5_000} = settings.opencode
+
+    assert {:error, {:invalid_workflow_config, message}} =
+             Schema.parse(%{
+               tracker: %{kind: "memory"},
+               opencode: %{model: "openai/gpt-5.5", startup_timeout_ms: 0}
+             })
+
+    assert message =~ "opencode.startup_timeout_ms"
   end
 
   test "schema parse normalizes policy keys and env-backed fallbacks" do

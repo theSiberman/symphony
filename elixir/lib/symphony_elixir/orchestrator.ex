@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @terminal_workspace_reconciliation_interval_ms :timer.minutes(5)
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -31,6 +32,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_interval_ms,
       :max_concurrent_agents,
       :next_poll_due_at_ms,
+      :next_terminal_workspace_reconciliation_at_ms,
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
@@ -40,6 +42,7 @@ defmodule SymphonyElixir.Orchestrator do
       exception_scope: nil,
       admission_task: nil,
       admission_command: nil,
+      admission_context: nil,
       admission: :unchecked,
       running: %{},
       completed: MapSet.new(),
@@ -80,7 +83,6 @@ defmodule SymphonyElixir.Orchestrator do
           agent_rate_limits: nil
         }
 
-        run_terminal_workspace_cleanup()
         state = schedule_tick(state, 0)
 
         {:ok, state}
@@ -141,8 +143,17 @@ defmodule SymphonyElixir.Orchestrator do
     command = Config.settings!().agent.admission_command
     admission = if command == state.admission_command, do: result, else: :unchecked
     if match?({:waiting, _}, admission), do: Logger.info("Host admission: #{inspect(admission)}")
+
+    admission =
+      if admission == :available and state.admission_context != nil and state.admission_context.candidate == nil,
+        do: :idle,
+        else: admission
+
     state = %{state | admission_task: nil, admission: admission}
-    if admission == :available, do: send(self(), :run_poll_cycle)
+
+    if admission == :available and state.admission_context != nil and state.admission_context.candidate != nil,
+      do: send(self(), :run_poll_cycle)
+
     notify_dashboard()
     {:noreply, state}
   end
@@ -268,7 +279,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_agent_down(state, issue_id, running_entry, session_id, reason) do
-    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+    Logger.warning("Agent task exited for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id} reason=#{inspect(reason)}; handling failure")
 
     next_attempt =
       if transient_failure?(reason),
@@ -277,8 +288,10 @@ defmodule SymphonyElixir.Orchestrator do
 
     error = "agent exited: #{inspect(reason)}"
 
-    if next_attempt > Config.settings!().agent.max_abnormal_retries do
-      state = block_issue_from_entry(state, issue_id, running_entry, "retry limit reached: #{error}")
+    if budget_exhausted?(reason) or next_attempt > Config.settings!().agent.max_abnormal_retries do
+      prefix = if budget_exhausted?(reason), do: "execution budget exhausted", else: "retry limit reached"
+      error = "#{prefix}: #{error}"
+      state = block_issue_from_entry(state, issue_id, running_entry, error)
       state = put_in(state.blocked[issue_id][:pending_exception], error)
       replay_pending_exceptions(state)
     else
@@ -300,6 +313,11 @@ defmodule SymphonyElixir.Orchestrator do
        do: AgentRuntime.classify_failure(failure) == :transient
 
   defp transient_failure?(_reason), do: false
+
+  # Normalize this at the originating adapter: agent.kind can reload while a
+  # turn is running, so its budget must not be reclassified by the new adapter.
+  defp budget_exhausted?({:agent_failed, {:turn_budget_exhausted, _detail}}), do: true
+  defp budget_exhausted?(_reason), do: false
 
   defp replay_pending_exceptions(state) do
     writes =
@@ -369,13 +387,14 @@ defmodule SymphonyElixir.Orchestrator do
         state
       end
 
-    state = state |> replay_pending_exceptions() |> reconcile_running_labels() |> check_admission()
+    state = state |> replay_pending_exceptions() |> reconcile_running_labels()
 
     state =
       with :ok <- validate_label_ownership(state),
            :ok <- Config.validate!(),
-           {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
-           true <- available_slots(state) > 0 and admission_available?(state) do
+           {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+        Workspace.reconcile_cleanup()
+        state = maybe_reconcile_terminal_workspaces(state, issues)
         choose_issues(issues, state)
       else
         {:error, :missing_linear_api_token} ->
@@ -414,10 +433,10 @@ defmodule SymphonyElixir.Orchestrator do
 
         {:error, reason} ->
           Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
-          state
 
-        false ->
           state
+          |> maybe_reconcile_terminal_workspaces([])
+          |> check_admission(nil)
       end
 
     # Consume approval even when the queue is empty or tracker reads fail.
@@ -429,7 +448,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   # Admission is host state, never a ticket failure or tracker mutation. The
   # external timeout owns the command process group even if this task exits.
-  defp check_admission(state) do
+  defp check_admission(state, issue) do
+    context = admission_context(state, issue)
     command = Config.settings!().agent.admission_command
 
     cond do
@@ -442,35 +462,46 @@ defmodule SymphonyElixir.Orchestrator do
       command == nil ->
         %{state | admission: :available, admission_command: nil}
 
-      # There is deliberately no "running agents" branch here. There used to be
-      # one, forcing :unchecked whenever anything was running -- and since
-      # admission_available? demands :available, maybe_dispatch then
-      # short-circuited before choose_issues. With an admission_command set,
-      # Symphony could admit new work only while `running` was empty: a hard cap
-      # of one concurrent agent whatever max_concurrent_agents said, and a
-      # silent one, because the config read correctly and the dashboard simply
-      # showed a single agent.
-      #
-      # Probing while busy is safe here because the probe measures HOST capacity
-      # (disk), which is perfectly measurable with work in flight, and because
-      # an approval is single-use: maybe_dispatch consumes :available back to
-      # :idle at the end of every cycle, so each dispatch decision already rests
-      # on a probe from that same cycle. That consumption is what makes a
-      # separate freshness timer unnecessary.
-      state.admission == :available and state.admission_command == command ->
+      state.admission == :available and state.admission_command == command and
+          state.admission_context == context ->
         state
 
       true ->
-        task = Task.Supervisor.async_nolink(state.task_supervisor, fn -> run_admission(command) end)
+        task = Task.Supervisor.async_nolink(state.task_supervisor, fn -> run_admission(command, context) end)
 
-        %{state | admission_task: task, admission_command: command, admission: {:waiting, "checking host capacity"}}
+        %{
+          state
+          | admission_task: task,
+            admission_command: command,
+            admission_context: context,
+            admission: {:waiting, "checking host capacity"}
+        }
     end
   end
 
-  defp run_admission(command) do
-    case System.cmd("timeout", ["--kill-after=5s", "90s", "sh", "-c", command], stderr_to_stdout: true) do
-      {_output, 0} -> :available
-      {output, _status} -> {:waiting, String.slice(String.trim(output), 0, 1_000)}
+  defp admission_context(state, issue) do
+    workspace = fn entry ->
+      %{identifier: entry.identifier, workspace: Path.join(Config.local_workspace_root(), Workspace.workspace_key(entry))}
+    end
+
+    %{
+      version: 1,
+      owner_pid: String.to_integer(System.pid()),
+      candidate: if(issue, do: workspace.(issue)),
+      running: state.running |> Map.values() |> Enum.map(workspace) |> Enum.sort(),
+      identity: if(issue, do: Workspace.resume_identity(issue)),
+      workers: Config.settings!().worker.ssh_hosts
+    }
+  end
+
+  defp run_admission(command, context) do
+    case System.cmd("timeout", ["--kill-after=5s", "90s", "sh", "-c", command], stderr_to_stdout: true, env: [{"SYMPHONY_ADMISSION_CONTEXT", Jason.encode!(context)}]) do
+      {output, 0} ->
+        if String.trim(output) != "", do: Logger.info("Host admission: #{String.slice(String.trim(output), 0, 1_000)}")
+        :available
+
+      {output, _status} ->
+        {:waiting, String.slice(String.trim(output), 0, 1_000)}
     end
   end
 
@@ -571,7 +602,22 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec sort_issues_for_dispatch_for_test([Issue.t()]) :: [Issue.t()]
   def sort_issues_for_dispatch_for_test(issues) when is_list(issues) do
-    sort_issues_for_dispatch(issues)
+    sort_issues_for_dispatch(issues, fn _issue -> false end)
+  end
+
+  @doc false
+  @spec sort_issues_for_dispatch_for_test([Issue.t()], (Issue.t() -> boolean())) :: [Issue.t()]
+  def sort_issues_for_dispatch_for_test(issues, preserved?)
+      when is_list(issues) and is_function(preserved?, 1) do
+    sort_issues_for_dispatch(issues, preserved?)
+  end
+
+  @doc false
+  @spec sort_issues_for_dispatch_for_test([Issue.t()], (Issue.t() -> boolean()), State.t()) :: [Issue.t()]
+  def sort_issues_for_dispatch_for_test(issues, preserved?, %State{} = state)
+      when is_list(issues) and is_function(preserved?, 1) do
+    now_ms = System.monotonic_time(:millisecond)
+    sort_issues_for_dispatch(issues, preserved?, &retry_dispatch_rank(state, &1, now_ms))
   end
 
   @doc false
@@ -955,20 +1001,44 @@ defmodule SymphonyElixir.Orchestrator do
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
+    now_ms = System.monotonic_time(:millisecond)
 
-    issues
-    |> sort_issues_for_dispatch()
-    |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        retry = Map.get(state_acc.retry_attempts, issue.id, %{})
-        dispatch_issue(state_acc, issue, retry[:attempt], retry[:worker_host])
+    candidates =
+      issues
+      |> sort_issues_for_dispatch(&preserved_workspace?/1, &retry_dispatch_rank(state, &1, now_ms))
+      |> Enum.filter(&eligible_issue?(&1, state, active_states, terminal_states, now_ms))
+
+    if Config.settings!().agent.admission_command == nil do
+      Enum.reduce(candidates, state, &dispatch_eligible_candidate/2)
+    else
+      issue = List.first(candidates)
+      state = check_admission(state, issue)
+
+      if issue != nil and admission_available?(state) and state.admission_context == admission_context(state, issue) do
+        retry = Map.get(state.retry_attempts, issue.id, %{})
+        dispatch_issue(state, issue, retry[:attempt], retry[:worker_host])
       else
-        state_acc
+        state
       end
-    end)
+    end
   end
 
-  defp sort_issues_for_dispatch(issues) when is_list(issues) do
+  defp dispatch_eligible_candidate(issue, state) do
+    if should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set()) do
+      retry = Map.get(state.retry_attempts, issue.id, %{})
+      dispatch_issue(state, issue, retry[:attempt], retry[:worker_host])
+    else
+      state
+    end
+  end
+
+  defp sort_issues_for_dispatch(issues, preserved?)
+       when is_list(issues) and is_function(preserved?, 1) do
+    sort_issues_for_dispatch(issues, preserved?, fn _issue -> {1, 1, 0} end)
+  end
+
+  defp sort_issues_for_dispatch(issues, preserved?, retry_rank)
+       when is_list(issues) and is_function(preserved?, 1) and is_function(retry_rank, 1) do
     queued = Enum.filter(issues, &priority_donor?/1)
     by_id = Map.new(queued, &{&1.id, &1})
     by_identifier = Map.new(queued, &{&1.identifier, &1.id})
@@ -981,13 +1051,41 @@ defmodule SymphonyElixir.Orchestrator do
 
     ranks =
       Enum.reduce(queued, %{}, fn issue, ranks ->
-        inherit_dispatch_rank([issue.id], dispatch_rank(issue), edges, %{}, ranks)
+        inherit_dispatch_rank([issue.id], dependency_rank(issue), edges, %{}, ranks)
+      end)
+
+    dependency_ranks =
+      Enum.reduce(queued, MapSet.new(), fn issue, dependency_ranks ->
+        original = dependency_rank(issue)
+        effective = Map.get(ranks, issue.id, original)
+
+        if effective < original do
+          MapSet.put(dependency_ranks, effective)
+        else
+          dependency_ranks
+        end
       end)
 
     Enum.sort_by(issues, fn issue ->
-      original = dispatch_rank(issue)
+      original = dependency_rank(issue)
       id = if is_struct(issue, Issue), do: issue.id
-      {Map.get(ranks, id, original), original}
+
+      {effective_priority, effective_created_at, effective_identifier} =
+        Map.get(ranks, id, original)
+
+      {
+        effective_priority,
+        dependency_group_rank(
+          original,
+          {effective_priority, effective_created_at, effective_identifier},
+          dependency_ranks
+        ),
+        preserved_rank(issue, preserved?),
+        retry_rank.(issue),
+        effective_created_at,
+        effective_identifier,
+        original
+      }
     end)
   end
 
@@ -1033,11 +1131,55 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp dispatch_rank(%Issue{} = issue) do
-    {priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
+  defp dependency_rank(%Issue{} = issue) do
+    {
+      priority_rank(issue.priority),
+      issue_created_at_sort_key(issue),
+      issue.identifier || issue.id || ""
+    }
   end
 
-  defp dispatch_rank(_issue), do: {priority_rank(nil), issue_created_at_sort_key(nil), ""}
+  defp dependency_rank(_issue),
+    do: {priority_rank(nil), issue_created_at_sort_key(nil), ""}
+
+  defp preserved_rank(issue, preserved?) do
+    if preserved?.(issue), do: 0, else: 1
+  end
+
+  defp dependency_group_rank(original, effective, dependency_ranks) do
+    if MapSet.member?(dependency_ranks, effective) do
+      {0, effective, original}
+    else
+      {1, nil, nil}
+    end
+  end
+
+  defp retry_dispatch_rank(%State{} = state, %Issue{id: issue_id}, now_ms)
+       when is_binary(issue_id) and is_integer(now_ms) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{due_at_ms: due_at_ms} = retry when is_integer(due_at_ms) and due_at_ms <= now_ms ->
+        {0, retry_checkpoint_rank(retry), due_at_ms}
+
+      _ ->
+        {1, 1, 0}
+    end
+  end
+
+  defp retry_dispatch_rank(_state, _issue, _now_ms), do: {1, 1, 0}
+
+  defp retry_checkpoint_rank(retry) do
+    workspace_path = Map.get(retry, :workspace_path)
+
+    if is_binary(workspace_path) and workspace_path != "" do
+      0
+    else
+      1
+    end
+  end
+
+  defp preserved_workspace?(%Issue{} = issue) do
+    Config.settings!().worker.ssh_hosts == [] and Workspace.resume_identity(issue) != nil
+  end
 
   defp priority_rank(priority) when is_integer(priority) and priority in 1..4, do: priority
   defp priority_rank(_priority), do: 5
@@ -1049,16 +1191,18 @@ defmodule SymphonyElixir.Orchestrator do
   defp issue_created_at_sort_key(%Issue{}), do: 9_223_372_036_854_775_807
   defp issue_created_at_sort_key(_issue), do: 9_223_372_036_854_775_807
 
-  defp should_dispatch_issue?(
+  defp eligible_issue?(
          %Issue{} = issue,
          %State{running: running, claimed: claimed, blocked: blocked} = state,
          active_states,
-         terminal_states
-       ) do
+         terminal_states,
+         now_ms
+       )
+       when is_integer(now_ms) do
     candidate_issue?(issue, active_states, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
-      retry_due?(state, issue.id) and
-      admission_available?(state) and
+      retry_due?(state, issue.id, now_ms) and
+      state.exception_error == nil and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
       available_slots(state) > 0 and
@@ -1066,12 +1210,26 @@ defmodule SymphonyElixir.Orchestrator do
       worker_slots_available?(state)
   end
 
-  defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+  defp eligible_issue?(_issue, _state, _active_states, _terminal_states, _now_ms), do: false
 
-  defp retry_due?(state, id) do
+  defp should_dispatch_issue?(issue, state, active_states, terminal_states, now_ms) do
+    admission_available?(state) and eligible_issue?(issue, state, active_states, terminal_states, now_ms)
+  end
+
+  defp should_dispatch_issue?(issue, state, active_states, terminal_states) do
+    should_dispatch_issue?(
+      issue,
+      state,
+      active_states,
+      terminal_states,
+      System.monotonic_time(:millisecond)
+    )
+  end
+
+  defp retry_due?(state, id, now_ms) do
     case state.retry_attempts[id] do
       nil -> true
-      retry -> retry.due_at_ms <= System.monotonic_time(:millisecond)
+      retry -> retry.due_at_ms <= now_ms
     end
   end
 
@@ -1152,7 +1310,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     case with(:ok <- validate_label_ownership(state), do: refresh_issue_for_dispatch(issue)) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        if Config.settings!().agent.admission_command == nil or
+             (admission_available?(state) and state.admission_context == admission_context(state, refreshed_issue)) do
+          do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        else
+          %{state | admission: :idle}
+        end
 
       {:skip, _reason} ->
         state
@@ -1328,7 +1491,8 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry_entry, :issue_url),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          due_at_ms: Map.get(retry_entry, :due_at_ms)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1405,21 +1569,23 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
 
-  defp run_terminal_workspace_cleanup do
-    case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
-      {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{} = issue ->
-            cleanup_issue_workspace(issue)
+  defp maybe_reconcile_terminal_workspaces(%State{} = state, active_issues) when is_list(active_issues) do
+    now_ms = System.monotonic_time(:millisecond)
+    protected_issues = active_issues ++ Enum.map(state.running, fn {_issue_id, entry} -> entry end)
 
-          _ ->
-            :ok
-        end)
-
-      {:error, reason} ->
-        Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+    if is_nil(state.next_terminal_workspace_reconciliation_at_ms) or
+         now_ms >= state.next_terminal_workspace_reconciliation_at_ms do
+      Workspace.reconcile_terminal_workspaces(protected_issues)
+      %{state | next_terminal_workspace_reconciliation_at_ms: now_ms + @terminal_workspace_reconciliation_interval_ms}
+    else
+      state
     end
+  end
+
+  @doc false
+  @spec reconcile_terminal_workspaces_for_test(State.t(), [map()]) :: State.t()
+  def reconcile_terminal_workspaces_for_test(%State{} = state, active_issues) when is_list(active_issues) do
+    maybe_reconcile_terminal_workspaces(state, active_issues)
   end
 
   defp notify_dashboard do
@@ -1428,7 +1594,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_active_retry(state, issue, attempt, metadata) do
     # Retries rejoin the same priority/dependency selection as new work.
-    retry = Map.merge(metadata, %{attempt: attempt, due_at_ms: System.monotonic_time(:millisecond)})
+    due_at_ms = metadata[:due_at_ms] || System.monotonic_time(:millisecond)
+    retry = Map.merge(metadata, %{attempt: attempt, due_at_ms: due_at_ms})
     state = %{state | claimed: MapSet.delete(state.claimed, issue.id), retry_attempts: Map.put(state.retry_attempts, issue.id, retry)}
     send(self(), :run_poll_cycle)
     {:noreply, state}

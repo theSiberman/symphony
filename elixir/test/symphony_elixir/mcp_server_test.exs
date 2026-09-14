@@ -94,6 +94,39 @@ defmodule SymphonyElixir.McpServerTest do
 
       assert response["error"]["code"] == -32_602
     end
+
+    test "uses the bound tracker when no executor override is supplied" do
+      binding = %{
+        adapter: SymphonyElixir.Tracker.Memory,
+        tracker_settings: %{kind: "memory"},
+        tool_specs: [],
+        secret_environment_names: []
+      }
+
+      request = %{
+        "id" => 61,
+        "method" => "tools/call",
+        "params" => %{"name" => "unsupported_tool", "arguments" => %{}}
+      }
+
+      assert {:reply, response} = Server.handle(request, binding: binding)
+      assert response["result"]["isError"]
+      assert [content] = response["result"]["content"]
+      assert content["text"] =~ "Unsupported dynamic tool"
+    end
+
+    test "translates tracker output-only and unexpected response shapes" do
+      output_executor = fn _tool, _args -> %{"success" => true, "output" => "plain tracker output"} end
+      fallback_executor = fn _tool, _args -> %{"success" => true, "unexpected" => "response shape"} end
+      request = %{"id" => 62, "method" => "tools/call", "params" => %{"name" => "github_api"}}
+
+      assert {:reply, output_response} = Server.handle(request, binding: tools(), executor: output_executor)
+      assert output_response["result"]["content"] == [%{"type" => "text", "text" => "plain tracker output"}]
+
+      assert {:reply, fallback_response} = Server.handle(request, binding: tools(), executor: fallback_executor)
+      assert [content] = fallback_response["result"]["content"]
+      assert content["text"] =~ "unexpected"
+    end
   end
 
   describe "protocol errors" do
@@ -131,6 +164,25 @@ defmodule SymphonyElixir.McpServerTest do
         |> post("/mcp", Jason.encode!(%{"jsonrpc" => "2.0", "id" => 9, "method" => "initialize"}))
 
       assert json_response(conn, 200)["result"]["serverInfo"]["name"] == "symphony-tracker"
+    end
+
+    test "acknowledges JSON-RPC notifications without a response body" do
+      start_test_endpoint()
+
+      conn =
+        build_conn()
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+        |> post("/mcp", Jason.encode!(%{"jsonrpc" => "2.0", "method" => "notifications/initialized"}))
+
+      assert conn.status == 202
+      assert response(conn, 202) == ""
+    end
+
+    test "turns an unexpected direct controller payload into an invalid-request reply" do
+      conn = SymphonyElixirWeb.McpController.rpc(build_conn(), :unexpected_payload)
+
+      assert conn.status == 200
+      assert Jason.decode!(conn.resp_body)["error"]["code"] == -32_600
     end
   end
 
