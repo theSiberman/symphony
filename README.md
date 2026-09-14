@@ -77,6 +77,8 @@ and current workers, retaining useful build output while reserving future growth
 Explicit provisioning identities distinguish resumable workspaces from partial
 checkouts. The Elixir implementation also supports deployment-owned per-workspace
 OpenCode endpoints and retries failed workspace cleanup independently of delivery.
+Child issues normally use a parent integration branch; the `integration:main` label routes
+children of retired parent branches to `main` before workspace creation.
 An exhausted OpenCode turn budget creates a durable actionable hold instead of
 restarting the same work. Fabula's test runner separately supervises subprocess
 inactivity; Symphony's synchronous OpenCode adapter applies a whole-turn budget
