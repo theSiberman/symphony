@@ -934,15 +934,19 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(worker_host), do: worker_host
 
   defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
-    build_issue_context(issue_id, identifier, IntegrationTarget.for_issue(issue))
+    build_issue_context(issue_id, identifier, integration_target(issue))
   end
 
   defp issue_context(identifier) when is_binary(identifier) do
-    build_issue_context(nil, identifier, IntegrationTarget.for_issue(nil))
+    build_issue_context(nil, identifier, integration_target(nil))
   end
 
   defp issue_context(_identifier) do
-    build_issue_context(nil, "issue", IntegrationTarget.for_issue(nil))
+    build_issue_context(nil, "issue", integration_target(nil))
+  end
+
+  defp integration_target(issue) do
+    IntegrationTarget.for_issue(issue, Config.settings!().tracker.child_integration_target)
   end
 
   defp build_issue_context(issue_id, issue_identifier, integration_target) do

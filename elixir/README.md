@@ -216,10 +216,11 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
-- A child issue normally integrates into its parent's `spec/<number>-*` branch. Add the
-  `integration:main` issue label when the parent branch has been retired and the child must
-  start from `main`; Symphony keeps the parent number in hook metadata. Apply the label before
-  dispatch, since an existing workspace retains its original integration commit.
+- A child issue normally integrates into its parent's `spec/<number>-*` branch. Set
+  `tracker.child_integration_target: main` for repositories whose child issues land independently
+  on `main`. The `integration:main` and `integration:parent` labels override that workflow default
+  per issue; Symphony keeps the parent number in hook metadata. Apply an override before dispatch,
+  since an existing workspace retains its original integration commit.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or

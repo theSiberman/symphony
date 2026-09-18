@@ -395,6 +395,15 @@ Fields:
   - An issue MUST contain every configured label to dispatch or continue.
   - Matching ignores case and surrounding whitespace.
   - A blank configured label matches no issue.
+- `child_integration_target` (`parent` or `main`)
+  - Default: `parent`.
+  - `parent` routes a native child issue to the parent branch selector
+    `spec/<parent-number>-*`; `main` routes it to `main` while preserving parent metadata.
+  - The issue labels `integration:main` and `integration:parent` override the configured default.
+  - Any other value is a configuration validation error.
+  - Changes are dynamically reloaded and apply to integration-target resolutions performed after
+    the reload. Existing workspaces retain the integration branch and commit recorded when they
+    were provisioned.
 - `active_states` (list of strings)
   - REQUIRED unless the selected adapter profile documents a default.
   - Values are provider-native state names compared case-insensitively by the scheduler.

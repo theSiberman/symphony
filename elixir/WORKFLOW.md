@@ -3,6 +3,8 @@ tracker:
   kind: linear
   provider:
     project_slug: "symphony-0c79b11b75ea"
+  # Child issues target their parent spec branch unless this is set to main.
+  child_integration_target: parent
   required_labels: []
   active_states:
     - Todo

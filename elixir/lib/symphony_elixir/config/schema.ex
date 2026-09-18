@@ -53,6 +53,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      field(:child_integration_target, :string, default: "parent")
       field(:provider, :map, default: %{})
       field(:secret_environment_names, {:array, :string}, default: [])
       field(:required_labels, {:array, :string}, default: [])
@@ -71,6 +72,7 @@ defmodule SymphonyElixir.Config.Schema do
           :api_key,
           :project_slug,
           :assignee,
+          :child_integration_target,
           :provider,
           :required_labels,
           :active_states,
@@ -78,6 +80,7 @@ defmodule SymphonyElixir.Config.Schema do
         ],
         empty_values: []
       )
+      |> validate_inclusion(:child_integration_target, ["main", "parent"])
       |> update_change(:required_labels, fn labels ->
         labels
         |> Enum.map(&(String.trim(&1) |> String.downcase()))

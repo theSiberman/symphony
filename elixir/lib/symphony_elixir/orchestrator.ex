@@ -1802,7 +1802,11 @@ defmodule SymphonyElixir.Orchestrator do
           issue_id: issue_id,
           identifier: metadata.identifier,
           issue_url: metadata.issue.url,
-          integration_target: IntegrationTarget.for_issue(metadata.issue),
+          integration_target:
+            IntegrationTarget.for_issue(
+              metadata.issue,
+              Config.settings!().tracker.child_integration_target
+            ),
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),

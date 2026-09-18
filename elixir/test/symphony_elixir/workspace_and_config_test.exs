@@ -1089,6 +1089,38 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace hook receives the configured child integration target" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-child-integration-target-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        tracker_child_integration_target: "main",
+        hook_after_create: "printf '%s' \"$SYMPHONY_INTEGRATION_BRANCH\" > integration-target.log"
+      )
+
+      assert Config.settings!().tracker.child_integration_target == "main"
+
+      issue = %Issue{
+        id: "534-child",
+        identifier: "GH-536",
+        native_ref: %{"parent_number" => 534}
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.read!(Path.join(workspace, "integration-target.log")) == "main"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace removal stays pending when before_remove hook fails" do
     test_root =
       Path.join(
