@@ -316,6 +316,20 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     assert blocked_issue.blocked_by == [%{"id" => 1041, "identifier" => "GH-41", "state" => "open"}]
   end
 
+  test "label-state deployments query native closed issues for terminal cleanup" do
+    settings = tracker_settings(%{"state_source" => "labels"})
+
+    request_fun = fn "GET", "/repos/octo/repo/issues", params, nil, _settings ->
+      assert params["state"] == "closed"
+      refute Map.has_key?(params, "labels")
+      {:ok, %{status: 200, body: [Map.put(raw_issue(42), "state", "closed"), raw_issue(43)]}}
+    end
+
+    assert {:ok, [closed]} = GitHubClient.fetch_issues_by_states_for_test(["closed"], settings, request_fun)
+    assert closed.id == "42"
+    assert closed.state == "closed"
+  end
+
   test "label-state refresh returns current structure and blocker snapshots" do
     refreshed =
       raw_issue(42)

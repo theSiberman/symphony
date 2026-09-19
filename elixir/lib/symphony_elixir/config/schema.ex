@@ -53,6 +53,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      field(:child_integration_target, :string, default: "main")
       field(:provider, :map, default: %{})
       field(:secret_environment_names, {:array, :string}, default: [])
       field(:required_labels, {:array, :string}, default: [])
@@ -71,6 +72,7 @@ defmodule SymphonyElixir.Config.Schema do
           :api_key,
           :project_slug,
           :assignee,
+          :child_integration_target,
           :provider,
           :required_labels,
           :active_states,
@@ -78,6 +80,7 @@ defmodule SymphonyElixir.Config.Schema do
         ],
         empty_values: []
       )
+      |> validate_inclusion(:child_integration_target, ["main", "parent"])
       |> update_change(:required_labels, fn labels ->
         labels
         |> Enum.map(&(String.trim(&1) |> String.downcase()))
@@ -263,6 +266,7 @@ defmodule SymphonyElixir.Config.Schema do
       # which lets an operator point at a server they supervise themselves.
       field(:command, :string, default: "opencode serve")
       field(:base_url, :string)
+      field(:workspace_runtime, :boolean, default: false)
       field(:port, :integer, default: 4096)
       field(:host, :string, default: "127.0.0.1")
       # provider/model, as `opencode models` prints it.
@@ -286,6 +290,7 @@ defmodule SymphonyElixir.Config.Schema do
         [
           :command,
           :base_url,
+          :workspace_runtime,
           :port,
           :host,
           :model,
@@ -299,7 +304,7 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_number(:port, greater_than: 0, less_than: 65_536)
-      |> validate_number(:turn_timeout_ms, greater_than: 0)
+      |> validate_number(:turn_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:startup_timeout_ms, greater_than: 0)
     end

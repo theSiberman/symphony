@@ -161,9 +161,6 @@ defmodule SymphonyElixir.Codex.Adapter do
           nil -> {:cont, nil}
           rate_limits -> {:halt, rate_limits}
         end
-
-      _value, result ->
-        {:halt, result}
     end)
   end
 

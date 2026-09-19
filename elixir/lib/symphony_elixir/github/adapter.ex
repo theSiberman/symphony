@@ -36,19 +36,23 @@ defmodule SymphonyElixir.GitHub.Adapter do
   end
 
   @spec pause_issue(SymphonyElixir.Tracker.Issue.t(), String.t()) :: :ok | {:error, term()}
-  def pause_issue(issue, reason) do
+  def pause_issue(issue, reason), do: pause_issue(issue, reason, :reporter)
+
+  @spec pause_issue(SymphonyElixir.Tracker.Issue.t(), String.t(), :reporter | :operator) ::
+          :ok | {:error, term()}
+  def pause_issue(issue, reason, audience) when audience in [:reporter, :operator] do
     settings = SymphonyElixir.Config.settings!().tracker
     {_url, repo} = Client.repository_identity(settings)
     path = "/repos/#{repo}/issues/#{issue.id}"
     client = client_module()
     opts = [tracker_settings: settings]
+    {hold_label, guidance} = pause_policy(audience)
 
     operations =
-      [{"POST", path <> "/labels", %{"labels" => ["needs-info"]}}] ++
+      [{"POST", path <> "/labels", %{"labels" => [hold_label]}}] ++
         Enum.map(settings.required_labels, fn label -> {"DELETE", path <> "/labels/" <> URI.encode(label, &URI.char_unreserved?/1), nil} end) ++
         [
-          {"POST", path <> "/comments",
-           %{"body" => "Symphony preserved this candidate after repeated worker failures. #{reason}. Inspect the preserved workspace and worker logs, then restore queue membership when resolved."}}
+          {"POST", path <> "/comments", %{"body" => "Symphony preserved this candidate after a worker failure. #{reason}. #{guidance}"}}
         ]
 
     Enum.reduce_while(operations, :ok, fn {method, endpoint, body}, :ok ->
@@ -59,6 +63,12 @@ defmodule SymphonyElixir.GitHub.Adapter do
       end
     end)
   end
+
+  defp pause_policy(:reporter),
+    do: {"needs-info", "Reporter input is required before restoring queue membership."}
+
+  defp pause_policy(:operator),
+    do: {"needs-triage", "An operator must inspect the preserved workspace and worker logs, repair the infrastructure failure, then restore queue membership."}
 
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs, do: AgentTool.tool_specs()

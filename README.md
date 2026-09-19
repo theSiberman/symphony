@@ -10,7 +10,8 @@ _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), S
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 
-The dispatch queue defaults to priority, then oldest first. A newer blocker inherits
+The dispatch queue defaults to priority, then prefers due retries, preserved local
+workspaces, and finally the oldest issue. A newer blocker inherits
 the best queue position of the active tickets waiting on it, including through
 dependency chains. Ranking is recalculated each poll without interrupting running
 workers or admitting paused, excluded or still-blocked tickets.
@@ -22,12 +23,16 @@ Exit zero admits work; missing executables, failures and stale results mean host
 waiting. Polling/reconciliation remain responsive; labels and retry counts are
 unchanged by host waiting. The snapshot/API exposes `admission.status` and `reason`.
 
-Retries rejoin the ordinary dependency/priority selection when their backoff is
-due. Only running workers consume execution slots. Normal continuation resets the
+Retries become eligible only when their backoff is due and are preferred within
+the same effective priority. The oldest due checkpoint runs first, so another retry
+gets the next slot instead of being starved by a continuation. Only running workers
+consume execution slots. Normal continuation resets the
 abnormal-failure count; `agent.max_abnormal_retries` defaults to three. Exhaustion
 preserves work and records a pending exception under the workspace root before
-asking the tracker to hold the issue. GitHub uses `needs-info` and removes queue
-labels. Pending writes replay before dispatch, including after restart; the marker
+asking the tracker to hold the issue. GitHub uses `needs-info` for exhausted work
+that needs reporter input and `needs-triage` for deterministic infrastructure
+configuration failures; both remove queue labels. Pending writes replay before
+dispatch, including after restart; the marker
 is removed only after the tracker confirms the hold. Markers carry their original
 non-secret repository identity; a scope change cannot redirect a pending hold.
 Unreadable or mismatched markers block
@@ -68,3 +73,20 @@ See the [GitHub adapter configuration](elixir/README.md#github-issues-adapter) f
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
+
+Storage-aware deployments can bind each admission decision to the selected ticket
+and current workers, retaining useful build output while reserving future growth.
+Explicit provisioning identities distinguish resumable workspaces from partial
+checkouts. The Elixir implementation also supports deployment-owned per-workspace
+OpenCode endpoints and retries failed workspace cleanup independently of delivery.
+Child issues use `main` by default. Legacy workflows that still accumulate work
+on a Product Spec branch can opt in with `tracker.child_integration_target: parent`;
+`integration:main` and `integration:parent` provide per-issue overrides before workspace creation.
+An exhausted OpenCode turn budget creates a durable actionable hold instead of
+restarting the same work. Fabula's test runner separately supervises subprocess
+inactivity; Symphony's synchronous OpenCode adapter applies a whole-turn budget
+and does not report intermediate progress.
+
+Malformed OpenCode response bodies are reported as failures. In particular, a
+completed turn must carry an assistant message or an explicit assistant error;
+failed turns do not emit successful completion events.

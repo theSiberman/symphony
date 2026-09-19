@@ -12,26 +12,48 @@ defmodule SymphonyElixir.FailureRecoveryTest do
       end)
     end
 
-    def request(method, path, _params, _body, _opts) do
+    def request(method, path, _params, body, _opts) do
+      block_request_until_test_allows_it()
+
       Agent.get_and_update(__MODULE__, fn state ->
         state = %{state | requests: state.requests + 1}
 
         if state.pause_error do
           {{:ok, %{status: 503, body: %{}}}, state}
         else
-          issues = updated_issues(state.issues, method, path)
+          issues = updated_issues(state.issues, method, path, body)
           {{:ok, %{status: 200, body: %{}}}, %{state | issues: issues}}
         end
       end)
     end
 
-    defp updated_issues(issues, "DELETE", path) do
-      if String.ends_with?(path, "/ready-for-agent"),
-        do: Enum.map(issues, &%{&1 | state: "needs-info", labels: ["needs-info"]}),
+    defp block_request_until_test_allows_it do
+      case Agent.get(__MODULE__, &Map.get(&1, :request_gate)) do
+        nil ->
+          :ok
+
+        test_pid ->
+          send(test_pid, {:offline_tracker_request_started, self()})
+
+          receive do
+            :allow_offline_tracker_request -> :ok
+          end
+      end
+    end
+
+    defp updated_issues(issues, "POST", path, %{"labels" => [label]}) do
+      if String.ends_with?(path, "/labels"),
+        do: Enum.map(issues, &%{&1 | state: label, labels: Enum.uniq([label | &1.labels])}),
         else: issues
     end
 
-    defp updated_issues(issues, _method, _path), do: issues
+    defp updated_issues(issues, "DELETE", path, _body) do
+      if String.ends_with?(path, "/ready-for-agent"),
+        do: Enum.map(issues, &%{&1 | labels: List.delete(&1.labels, "ready-for-agent")}),
+        else: issues
+    end
+
+    defp updated_issues(issues, _method, _path, _body), do: issues
   end
 
   setup do
@@ -46,7 +68,7 @@ defmodule SymphonyElixir.FailureRecoveryTest do
       dispatchable: true
     }
 
-    initial = %{issues: [issue], lookup_error: false, pause_error: false, requests: 0}
+    initial = %{issues: [issue], lookup_error: false, pause_error: false, request_gate: nil, requests: 0}
     provider = start_supervised!({Agent, fn -> initial end})
     Process.register(provider, OfflineGitHub)
     original = Application.get_env(:symphony_elixir, :github_client_module)
@@ -113,6 +135,58 @@ defmodule SymphonyElixir.FailureRecoveryTest do
     assert Agent.get(OfflineGitHub, & &1.issues) == [issue]
   end
 
+  test "an exhausted OpenCode turn blocks its first retry and preserves the exception across restart", %{root: root, issue: issue} do
+    workflow = Workflow.workflow_file_path()
+    File.write!(workflow, String.replace(File.read!(workflow), "agent:\n", "agent:\n  kind: opencode\n"))
+    WorkflowStore.force_reload()
+    update(%{pause_error: true})
+    pid = start_supervised!({Orchestrator, name: TurnBudgetRecovery})
+    # A runtime reload must not reinterpret the originating adapter's budget.
+    configure(root, "true")
+    failure = {:agent_failed, {:turn_budget_exhausted, %{"name" => "TurnBudgetExceeded", "data" => %{"turn_timeout_ms" => 100}}}}
+    crash(pid, issue, 0, failure)
+    eventually(fn -> :sys.get_state(pid).running == %{} end)
+    assert :sys.get_state(pid).retry_attempts == %{}
+    assert {:ok, [marker]} = Workspace.pending_exceptions()
+    assert marker["reason"] =~ "TurnBudgetExceeded"
+    refute File.exists?(Path.join(root, "worker-started"))
+
+    stop_supervised!(Orchestrator)
+    restarted = start_supervised!({Orchestrator, name: TurnBudgetRecovery})
+    assert %{running: [], retrying: []} = GenServer.call(restarted, :snapshot)
+    update(%{pause_error: false})
+    send(restarted, :run_poll_cycle)
+    eventually(fn -> Workspace.pending_exceptions() == {:ok, []} end)
+    assert [%Issue{state: "needs-info"}] = Agent.get(OfflineGitHub, & &1.issues)
+    refute File.exists?(Path.join(root, "worker-started"))
+  end
+
+  test "an integration selector configuration failure fails fast and survives restart for an operator", %{
+    root: root,
+    issue: issue
+  } do
+    update(%{pause_error: true})
+    pid = start_supervised!({Orchestrator, name: SelectorConfigurationRecovery})
+
+    failure =
+      {:agent_failed, {:workspace_hook_failed, "after_create", 78, "integration target selector spec/496-* resolved 0 branches; expected exactly one"}}
+
+    crash(pid, issue, 0, failure)
+    eventually(fn -> :sys.get_state(pid).running == %{} end)
+    assert :sys.get_state(pid).retry_attempts == %{}
+    assert {:ok, [marker]} = Workspace.pending_exceptions()
+    assert marker["audience"] == "operator"
+    assert marker["reason"] =~ "integration target selector"
+
+    stop_supervised!(Orchestrator)
+    update(%{pause_error: false})
+    restarted = start_supervised!({Orchestrator, name: SelectorConfigurationRecovery})
+    send(restarted, :run_poll_cycle)
+    eventually(fn -> Workspace.pending_exceptions() == {:ok, []} end)
+    assert [%Issue{state: "needs-triage"}] = Agent.get(OfflineGitHub, & &1.issues)
+    refute File.exists?(Path.join(root, "worker-started"))
+  end
+
   for {label, detail} <- [
         {"bad request", %{"error" => %{"codexErrorInfo" => "badRequest"}}},
         {"unauthorized", %{"data" => %{"codexErrorInfo" => "unauthorized"}}},
@@ -149,21 +223,24 @@ defmodule SymphonyElixir.FailureRecoveryTest do
     assert {:ok, [^marker]} = Workspace.pending_exceptions()
   end
 
-  test "failed exception persistence survives restart before a workspace exists", %{root: root, issue: issue} do
-    update(%{pause_error: true})
+  test "restart interrupts a persisted exception before tracker mutation and replays it", %{root: root, issue: issue} do
+    update(%{request_gate: self()})
     pid = start_supervised!({Orchestrator, name: ExceptionRecovery})
     crash(pid, issue, 3, :boom)
-    eventually(fn -> match?({:ok, [_]}, Workspace.pending_exceptions()) end)
+    assert_receive {:offline_tracker_request_started, ^pid}, 1_000
+    assert {:ok, [_]} = Workspace.pending_exceptions()
+    requests_before_restart = Agent.get(OfflineGitHub, & &1.requests)
+    assert requests_before_restart == 0
     refute File.exists?(Path.join([root, "workspaces", "GH-17"]))
+
     stop_supervised!(Orchestrator)
     configure(root, "true")
+    update(%{request_gate: nil})
     restarted = start_supervised!({Orchestrator, name: ExceptionRecovery})
-    eventually(fn -> Agent.get(OfflineGitHub, & &1.requests) >= 2 end)
     assert %{running: []} = GenServer.call(restarted, :snapshot)
     refute File.exists?(Path.join(root, "worker-started"))
-    update(%{pause_error: false})
-    send(restarted, :run_poll_cycle)
     eventually(fn -> Workspace.pending_exceptions() == {:ok, []} end)
+    assert Agent.get(OfflineGitHub, & &1.requests) > requests_before_restart
     assert [%Issue{state: "needs-info"}] = Agent.get(OfflineGitHub, & &1.issues)
     refute File.exists?(Path.join(root, "worker-started"))
   end

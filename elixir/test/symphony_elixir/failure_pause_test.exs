@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.FailurePauseTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Tracker.Memory
+
   defmodule OfflineGitHub do
     def request(method, path, _params, body, _opts) do
       send(self(), {:request, method, path, body})
@@ -49,6 +51,20 @@ defmodule SymphonyElixir.FailurePauseTest do
     assert body =~ "worker OOM"
   end
 
+  test "operator failures use an operator-facing hold instead of needs-info", %{issue: issue} do
+    assert :ok = Tracker.pause_issue(issue, "integration target selector resolved 0 branches", :operator)
+
+    assert_receive {:request, "POST", "/repos/fixture/offline/issues/17/labels",
+                    %{
+                      "labels" => ["needs-triage"]
+                    }}
+
+    assert_receive {:request, "DELETE", "/repos/fixture/offline/issues/17/labels/ready-for-agent", nil}
+    assert_receive {:request, "POST", "/repos/fixture/offline/issues/17/comments", %{"body" => body}}
+    assert body =~ "operator"
+    refute body =~ "reporter"
+  end
+
   test "a failed exception write is visible and stops further mutation", %{issue: issue} do
     Process.put({:status, "POST"}, 503)
     assert {:error, {:pause_failed, _}} = Tracker.pause_issue(issue, "worker OOM")
@@ -60,5 +76,24 @@ defmodule SymphonyElixir.FailurePauseTest do
     Process.put({:status, "DELETE"}, 404)
     assert :ok = Tracker.pause_issue(issue, "worker OOM")
     assert_receive {:request, "POST", "/repos/fixture/offline/issues/17/comments", _}
+  end
+
+  test "memory adapter retains its reporter-facing compatibility entry point" do
+    issue = %Issue{id: "memory-17", identifier: "MEM-17", state: "ready", labels: ["ready"]}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    assert :ok = Memory.pause_issue(issue, "worker OOM")
+
+    assert [%Issue{state: "needs-info", labels: ["needs-info"]}] =
+             Application.fetch_env!(:symphony_elixir, :memory_tracker_issues)
+  end
+
+  test "trackers without hold support report both pause entry points as unsupported", %{issue: issue} do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
+
+    assert {:error, :tracker_pause_unsupported} = Tracker.pause_issue(issue, "worker OOM")
+
+    assert {:error, :tracker_pause_unsupported} =
+             Tracker.pause_issue(issue, "broken provisioning policy", :operator)
   end
 end

@@ -61,6 +61,34 @@ defmodule SymphonyElixir.OpencodeAdapterTest do
 
       assert {:error, {:opencode_session_malformed, _body}} = start_session(request_fun)
     end
+
+    test "propagates a failed session request" do
+      request_fun = fake_server(%{"/session" => {:error, {:opencode_http_error, 503, %{"error" => "unavailable"}}}})
+
+      assert {:error, {:opencode_http_error, 503, %{"error" => "unavailable"}}} = start_session(request_fun)
+    end
+  end
+
+  test "owned workspace endpoint supplies its own URL and credential" do
+    workspace = Path.join(Path.dirname(Workflow.workflow_file_path()), "owned-workspace")
+    File.mkdir_p!(Path.join(workspace, ".scratch"))
+    path = Path.join(workspace, ".scratch/opencode.json")
+    settings = Map.put(@settings, :workspace_runtime, true)
+    record = %{version: 1, workspace: workspace, base_url: "http://127.0.0.1:12345", password: "fixture-secret"}
+    File.write!(path, Jason.encode!(record))
+
+    request = fn :post, url, "/session", params, _body, opts ->
+      assert url == record.base_url
+      assert params == %{"directory" => workspace}
+      assert opts[:password] == "fixture-secret"
+      {:ok, %{"id" => "owned"}}
+    end
+
+    assert {:ok, %{session_id: "owned"}} = Adapter.start_session(workspace, settings: settings, request_fun: request)
+    File.write!(path, Jason.encode!(%{record | workspace: "/another/workspace"}))
+    assert_raise RuntimeError, fn -> Adapter.start_session(workspace, settings: settings, request_fun: request) end
+    File.rm!(path)
+    assert_raise RuntimeError, fn -> Adapter.start_session(workspace, settings: settings, request_fun: request) end
   end
 
   describe "tracker tools" do
@@ -121,32 +149,98 @@ defmodule SymphonyElixir.OpencodeAdapterTest do
       assert body["parts"] == [%{"type" => "text", "text" => "Deliver GH-1."}]
     end
 
-    test "omits a variant the policy does not set" do
+    test "keeps a manually supplied model usable when it has no provider prefix" do
       request_fun =
         fake_server(%{
           "/session" => {:ok, %{"id" => "ses_abc"}},
-          "/session/ses_abc/message" => {:ok, %{"info" => %{}}}
+          "/session/ses_abc/message" => {:ok, %{"info" => %{"role" => "assistant"}}}
         })
 
-      {:ok, session} = start_session(request_fun, %{@settings | variant: nil})
+      {:ok, session} = start_session(request_fun, %{@settings | model: "local-model"})
       assert {:ok, _result} = Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun)
 
       assert_received {:request, :post, _base, "/session", _params, _create}
       assert_received {:request, :post, _base, "/session/ses_abc/message", _params, body}
-      refute Map.has_key?(body, "variant")
+      assert body["model"] == %{"providerID" => "", "modelID" => "local-model"}
+    end
+
+    test "omits a variant the policy does not set" do
+      for variant <- [nil, ""] do
+        request_fun =
+          fake_server(%{
+            "/session" => {:ok, %{"id" => "ses_abc"}},
+            "/session/ses_abc/message" => {:ok, %{"info" => %{"role" => "assistant"}}}
+          })
+
+        {:ok, session} = start_session(request_fun, %{@settings | variant: variant})
+        assert {:ok, _result} = Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun)
+
+        assert_received {:request, :post, _base, "/session", _params, _create}
+        assert_received {:request, :post, _base, "/session/ses_abc/message", _params, body}
+        refute Map.has_key?(body, "variant")
+      end
     end
 
     test "surfaces an assistant-message error as a failed turn" do
       request_fun =
         fake_server(%{
           "/session" => {:ok, %{"id" => "ses_abc"}},
-          "/session/ses_abc/message" => {:ok, %{"info" => %{"error" => %{"name" => "ContextOverflowError"}}}}
+          "/session/ses_abc/message" => {:ok, %{"info" => %{"role" => "assistant", "error" => %{"name" => "ContextOverflowError"}}}}
         })
 
       {:ok, session} = start_session(request_fun)
 
       assert {:error, {:turn_failed, %{"name" => "ContextOverflowError"}}} =
                Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun)
+    end
+
+    test "surfaces a legacy atom-key assistant error as a failed turn" do
+      request_fun =
+        fake_server(%{
+          "/session" => {:ok, %{"id" => "ses_abc"}},
+          "/session/ses_abc/message" => {:ok, %{info: %{role: :assistant, error: %{name: "ContextOverflowError"}}}}
+        })
+
+      {:ok, session} = start_session(request_fun)
+
+      assert {:error, {:turn_failed, %{name: "ContextOverflowError"}}} =
+               Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun)
+    end
+
+    test "rejects a malformed successful message without reporting turn completion" do
+      request_fun =
+        fake_server(%{
+          "/session" => {:ok, %{"id" => "ses_abc"}},
+          "/session/ses_abc/message" => {:ok, ["not", "a", "message"]}
+        })
+
+      {:ok, session} = start_session(request_fun)
+      parent = self()
+
+      assert {:error, {:response_error, {:opencode_response_malformed, "/session/ses_abc/message", ["not", "a", "message"]}}} =
+               Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun, on_message: &send(parent, {:update, &1}))
+
+      assert_received {:update, %{event: :session_started, session_id: "ses_abc"}}
+      refute_received {:update, %{event: :turn_completed}}
+    end
+
+    test "rejects empty and malformed message wrappers without reporting turn completion" do
+      for response_body <- [%{}, %{"info" => "not a message"}, %{"message" => %{"info" => %{}}}] do
+        request_fun =
+          fake_server(%{
+            "/session" => {:ok, %{"id" => "ses_abc"}},
+            "/session/ses_abc/message" => {:ok, response_body}
+          })
+
+        {:ok, session} = start_session(request_fun)
+        parent = self()
+
+        assert {:error, {:response_error, {:opencode_response_malformed, "/session/ses_abc/message", ^response_body}}} =
+                 Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun, on_message: &send(parent, {:update, &1}))
+
+        assert_received {:update, %{event: :session_started, session_id: "ses_abc"}}
+        refute_received {:update, %{event: :turn_completed}}
+      end
     end
   end
 
@@ -155,7 +249,7 @@ defmodule SymphonyElixir.OpencodeAdapterTest do
       request_fun =
         fake_server(%{
           "/session" => {:ok, %{"id" => "ses_abc"}},
-          "/session/ses_abc/message" => {:ok, %{"info" => %{"tokens" => %{"input" => 40, "output" => 5}, "cost" => 0.01}}}
+          "/session/ses_abc/message" => {:ok, %{"info" => %{"role" => "assistant", "tokens" => %{"input" => 40, "output" => 5}, "cost" => 0.01}}}
         })
 
       {:ok, session} = start_session(request_fun)
@@ -179,7 +273,7 @@ defmodule SymphonyElixir.OpencodeAdapterTest do
       request_fun =
         fake_server(%{
           "/session" => {:ok, %{"id" => "ses_abc"}},
-          "/session/ses_abc/message" => {:ok, %{"info" => %{}}}
+          "/session/ses_abc/message" => {:ok, %{"info" => %{"role" => "assistant"}}}
         })
 
       {:ok, session} = start_session(request_fun)
@@ -188,7 +282,38 @@ defmodule SymphonyElixir.OpencodeAdapterTest do
   end
 
   describe "turn budget" do
-    test "an overrun turn is terminal, not a transient transport blip" do
+    test "zero disables the turn-wide deadline without changing other request timeouts" do
+      parent = self()
+
+      request_fun = fn _method, _base_url, path, _params, _body, opts ->
+        send(parent, {:request_timeout, path, Keyword.fetch!(opts, :receive_timeout)})
+
+        case path do
+          "/session" -> {:ok, %{"id" => "ses_abc"}}
+          "/session/ses_abc/message" -> {:ok, %{"info" => %{"role" => "assistant"}}}
+        end
+      end
+
+      {:ok, session} = start_session(request_fun, %{@settings | turn_timeout_ms: 0})
+      assert {:ok, _} = Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun)
+      assert_received {:request_timeout, "/session", 30_000}
+      assert_received {:request_timeout, "/session/ses_abc/message", :infinity}
+    end
+
+    test "a transport timeout with the deadline disabled is not a budget failure" do
+      request_fun =
+        fake_server(%{
+          "/session" => {:ok, %{"id" => "ses_abc"}},
+          "/session/ses_abc/message" => {:error, {:opencode_transport_error, %Req.TransportError{reason: :timeout}}}
+        })
+
+      {:ok, session} = start_session(request_fun, %{@settings | turn_timeout_ms: 0})
+
+      assert {:error, {:response_error, {:opencode_transport_error, %{reason: :timeout}}}} =
+               Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun)
+    end
+
+    test "an overrun turn exhausts the budget without an ordinary retry" do
       request_fun =
         fake_server(%{
           "/session" => {:ok, %{"id" => "ses_abc"}},
@@ -197,13 +322,13 @@ defmodule SymphonyElixir.OpencodeAdapterTest do
 
       {:ok, session} = start_session(request_fun)
 
-      assert {:error, {:turn_failed, %{"name" => "TurnBudgetExceeded"} = detail}} =
+      assert {:error, {:turn_budget_exhausted, %{"name" => "TurnBudgetExceeded"} = detail}} =
                Adapter.run_turn(session, "prompt", %{}, request_fun: request_fun)
 
       assert detail["data"]["turn_timeout_ms"] == @settings.turn_timeout_ms
 
       # Retrying spends the entire budget again on a turn that overruns again.
-      assert Adapter.classify_failure({:turn_failed, detail}) == :terminal
+      assert Adapter.classify_failure({:turn_budget_exhausted, detail}) == :terminal
     end
 
     test "a transport failure that is not the turn budget stays transient" do
@@ -238,9 +363,11 @@ defmodule SymphonyElixir.OpencodeAdapterTest do
 
     test "reads the upstream status inside an APIError rather than retrying blindly" do
       rate_limited = %{"name" => "APIError", "data" => %{"status" => 429}}
+      unavailable = %{"name" => "APIError", "data" => %{"statusCode" => 503}}
       bad_request = %{"name" => "APIError", "data" => %{"status" => 400}}
 
       assert Adapter.classify_failure({:turn_failed, rate_limited}) == :transient
+      assert Adapter.classify_failure({:turn_failed, unavailable}) == :transient
       assert Adapter.classify_failure({:turn_failed, bad_request}) == :terminal
     end
   end
@@ -272,6 +399,26 @@ defmodule SymphonyElixir.OpencodeAdapterTest do
       assert {%{}, nil} = Adapter.extract_usage(%{"info" => %{}})
       assert {%{}, nil} = Adapter.extract_usage(:not_a_map)
     end
+
+    test "reads a direct assistant message envelope" do
+      assert {%{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}, nil} =
+               Adapter.extract_usage(%{"tokens" => %{"input" => 2, "output" => 3}})
+    end
+  end
+
+  describe "stopping a session" do
+    test "tolerates both a completed abort and an abort endpoint failure" do
+      for {response, expected_status} <- [{http_response(200, "true"), 200}, {http_response(404, ~s({"error":"gone"})), 404}] do
+        {base_url, server} = start_abort_server(response)
+        session = %{base_url: base_url, session_id: "ses_abc", settings: %{@settings | base_url: base_url}}
+
+        assert :ok = Adapter.stop_session(session)
+        assert_receive {:abort_request, request}
+        assert String.starts_with?(request, "POST /session/ses_abc/abort HTTP/1.1")
+        assert :ok = Task.await(server)
+        assert expected_status in [200, 404]
+      end
+    end
   end
 
   describe "capabilities and configuration" do
@@ -301,5 +448,29 @@ defmodule SymphonyElixir.OpencodeAdapterTest do
       assert {:ok, Adapter} = AgentRuntime.adapter_for_kind("opencode")
       assert "opencode" in AgentRuntime.supported_kinds()
     end
+  end
+
+  defp start_abort_server(response) do
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, {:active, false}, {:reuseaddr, true}, ip: {127, 0, 0, 1}])
+    {:ok, {{127, 0, 0, 1}, port}} = :inet.sockname(listener)
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        {:ok, socket} = :gen_tcp.accept(listener)
+        {:ok, request} = :gen_tcp.recv(socket, 0)
+        send(parent, {:abort_request, request})
+        :ok = :gen_tcp.send(socket, response)
+        :ok = :gen_tcp.close(socket)
+        :ok = :gen_tcp.close(listener)
+      end)
+
+    {"http://127.0.0.1:#{port}", task}
+  end
+
+  defp http_response(status, body) do
+    reason = if status == 200, do: "OK", else: "Not Found"
+
+    "HTTP/1.1 #{status} #{reason}\r\ncontent-type: application/json\r\ncontent-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n#{body}"
   end
 end

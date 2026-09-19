@@ -25,9 +25,9 @@ defmodule SymphonyElixir.Mcp.Server do
   Handle one JSON-RPC request, returning the response map, or `:noreply` for a
   notification (which by JSON-RPC carries no id and must not be answered).
   """
-  @spec handle(map(), keyword()) :: {:reply, map()} | :noreply
   def handle(request, opts \\ [])
 
+  @spec handle(map(), keyword()) :: {:reply, map()} | :noreply
   def handle(%{"method" => "initialize", "id" => id}, _opts) do
     {:reply,
      result(id, %{
@@ -127,10 +127,10 @@ defmodule SymphonyElixir.Mcp.Server do
     do: %{"jsonrpc" => "2.0", "id" => id, "error" => %{"code" => code, "message" => message}}
 
   defp version do
-    case :application.get_key(:symphony_elixir, :vsn) do
-      {:ok, vsn} -> List.to_string(vsn)
-      _ -> "0.0.0"
-    end
+    # This server is reached through the endpoint supervised by this application,
+    # so its loaded application specification always has a version.
+    {:ok, vsn} = :application.get_key(:symphony_elixir, :vsn)
+    List.to_string(vsn)
   end
 
   defp maybe_put(map, _key, nil), do: map

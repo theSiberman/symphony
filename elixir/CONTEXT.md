@@ -11,13 +11,14 @@ to exactly one Product Spec.
 
 ## Integration target
 
-The destination into which a work item's changes must merge. A tracer's integration target is its
-parent Product Spec; an unrelated standalone work item's integration target is `main`.
+The destination into which a work item's changes must merge. A tracer targets `main` by default;
+a legacy workflow or explicit issue label can instead opt into its parent Product Spec. An
+unrelated standalone work item's integration target is always `main`.
 
 ## Integration branch
 
-The single branch that accumulates all tracers for one Product Spec before acceptance. Its name is
-`spec/<product-spec-number>-<slug>`.
+The optional branch that accumulates tracers for one Product Spec before acceptance. When a
+workflow uses parent integration, its name is `spec/<product-spec-number>-<slug>`.
 
 ## UAT evidence
 

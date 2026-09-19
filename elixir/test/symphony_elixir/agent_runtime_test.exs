@@ -3,6 +3,7 @@ defmodule SymphonyElixir.AgentRuntimeTest do
 
   alias SymphonyElixir.AgentRuntime
   alias SymphonyElixir.Codex.Adapter, as: CodexAdapter
+  alias SymphonyElixir.Usage.Payload
 
   describe "adapter selection" do
     test "resolves the declared kind and names the supported set when it is unknown" do
@@ -37,6 +38,64 @@ defmodule SymphonyElixir.AgentRuntimeTest do
       assert capabilities.rate_limit_reporting
       assert capabilities.sandbox_enforcement
       assert capabilities.session_resume
+    end
+  end
+
+  describe "runtime delegation" do
+    test "validates the selected adapter" do
+      assert :ok = AgentRuntime.validate_config(Config.settings!())
+
+      assert {:error, {:unsupported_agent_runtime_kind, "unknown"}} =
+               AgentRuntime.validate_config(%{agent: %{kind: "unknown"}})
+    end
+
+    test "runs a complete turn through the selected runtime adapter" do
+      test_root = Path.join(System.tmp_dir!(), "symphony-agent-runtime-#{System.unique_integer([:positive])}")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-RUNTIME")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      try do
+        File.mkdir_p!(workspace)
+
+        File.write!(codex_binary, """
+        #!/bin/sh
+        count=0
+        while IFS= read -r _line; do
+          count=$((count + 1))
+          case "$count" in
+            1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+            2) ;;
+            3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-runtime"}}}' ;;
+            4)
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-runtime"}}}'
+              printf '%s\\n' '{"method":"turn/completed"}'
+              exit 0
+              ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: workspace_root,
+          codex_command: "#{codex_binary} app-server"
+        )
+
+        assert {:ok, session} = AgentRuntime.start_session(workspace)
+
+        assert {:ok, %{thread_id: "thread-runtime", turn_id: "turn-runtime"}} =
+                 AgentRuntime.run_turn(session, "summarize the issue", %{
+                   id: "runtime-issue",
+                   identifier: "MT-RUNTIME",
+                   title: "Runtime delegation"
+                 })
+
+        assert :ok = AgentRuntime.stop_session(session)
+      after
+        File.rm_rf(test_root)
+      end
     end
   end
 
@@ -115,6 +174,56 @@ defmodule SymphonyElixir.AgentRuntimeTest do
     test "returns empty usage rather than failing on an unrecognised update" do
       assert {%{}, nil} = CodexAdapter.extract_usage(%{"unrelated" => true})
       assert {%{}, nil} = CodexAdapter.extract_usage(:not_a_map)
+    end
+
+    test "rejects malformed usage values and paths without raising" do
+      assert Payload.get(%{"total_tokens" => " 42 "}, "total_tokens") == 42
+      assert Payload.integer_like("not-a-number") == nil
+      assert Payload.integer_like("-1") == nil
+      assert Payload.map_at_path(:not_a_map, ["usage"]) == nil
+      assert Payload.explicit_map_at_paths(%{"usage" => "not-a-map"}, [["usage"]]) == nil
+      assert Payload.explicit_map_at_paths(:not_a_map, [["usage"]]) == nil
+      assert Payload.explicit_map_at_paths(%{}, :not_a_path_list) == nil
+    end
+
+    test "recognises supported Codex error envelopes and alternate usage locations" do
+      for key <- [
+            "responseStreamConnectionFailed",
+            "responseStreamDisconnected",
+            "responseTooManyFailedAttempts"
+          ] do
+        assert CodexAdapter.classify_failure({:turn_failed, %{"codexErrorInfo" => %{key => %{"httpStatusCode" => 503}}}}) ==
+                 :transient
+      end
+
+      assert CodexAdapter.classify_failure({:turn_failed, %{"codexErrorInfo" => %{"httpConnectionFailed" => "bad"}}}) ==
+               :terminal
+
+      completed = %{
+        "method" => "turn/completed",
+        "params" => %{"usage" => %{"input_tokens" => 7, "output_tokens" => 2}}
+      }
+
+      assert {%{"input_tokens" => 7, "output_tokens" => 2}, nil} = CodexAdapter.extract_usage(completed)
+
+      atom_completed = %{
+        method: :turn_completed,
+        params: %{usage: %{input_tokens: 3, output_tokens: 1}}
+      }
+
+      assert {%{input_tokens: 3, output_tokens: 1}, nil} = CodexAdapter.extract_usage(atom_completed)
+
+      atom_rate_limit_update = %{rate_limits: %{limit_id: "atom-limit", primary: %{used: 1}}}
+      assert {%{}, %{limit_id: "atom-limit"}} = CodexAdapter.extract_usage(atom_rate_limit_update)
+
+      list_rate_limit_update = %{
+        "payload" => [
+          %{"unrelated" => true},
+          %{"limit_id" => "secondary-limit", "secondary" => %{"used" => 2}}
+        ]
+      }
+
+      assert {%{}, %{"limit_id" => "secondary-limit"}} = CodexAdapter.extract_usage(list_rate_limit_update)
     end
   end
 end

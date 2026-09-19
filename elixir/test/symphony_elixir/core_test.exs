@@ -17,6 +17,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
+    assert config.tracker.child_integration_target == "main"
     assert config.agent.max_turns == 20
     assert config.agent.redispatch_on_transition_to == []
 
@@ -994,15 +995,21 @@ defmodule SymphonyElixir.CoreTest do
         labels: []
       }
 
+      original_due_at_ms = System.monotonic_time(:millisecond) - 5_000
+
       updated_state =
         Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 1, %{
           identifier: issue.identifier,
-          error: "agent exited"
+          error: "agent exited",
+          due_at_ms: original_due_at_ms,
+          workspace_path: "/recorded/workspaces/MT-566"
         })
 
       refute MapSet.member?(updated_state.claimed, issue_id)
       refute Map.has_key?(updated_state.running, issue_id)
-      assert %{attempt: 1} = updated_state.retry_attempts[issue_id]
+
+      assert %{attempt: 1, due_at_ms: ^original_due_at_ms, workspace_path: "/recorded/workspaces/MT-566"} =
+               updated_state.retry_attempts[issue_id]
     after
       File.rm_rf(test_root)
     end
@@ -1160,14 +1167,22 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    before_down_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
     state = :sys.get_state(pid)
+    after_state_observation_ms = System.monotonic_time(:millisecond)
 
-    assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
+    assert %{
+             attempt: 3,
+             due_at_ms: due_at_ms,
+             timer_ref: timer_ref,
+             identifier: "MT-559",
+             error: "agent exited: :boom"
+           } =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 38_000, 40_500)
+    assert is_reference(timer_ref)
+    assert_retry_deadline_after_event(due_at_ms, before_down_ms, after_state_observation_ms, 40_000)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1199,14 +1214,22 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    before_down_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
     state = :sys.get_state(pid)
+    after_state_observation_ms = System.monotonic_time(:millisecond)
 
-    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
+    assert %{
+             attempt: 1,
+             due_at_ms: due_at_ms,
+             timer_ref: timer_ref,
+             identifier: "MT-560",
+             error: "agent exited: :boom"
+           } =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert is_reference(timer_ref)
+    assert_retry_deadline_after_event(due_at_ms, before_down_ms, after_state_observation_ms, 10_000)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -1326,11 +1349,10 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+  defp assert_retry_deadline_after_event(due_at_ms, before_down_ms, after_state_observation_ms, delay_ms) do
+    assert due_at_ms >= before_down_ms + delay_ms
+    assert due_at_ms <= after_state_observation_ms + delay_ms
+    assert due_at_ms > after_state_observation_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)

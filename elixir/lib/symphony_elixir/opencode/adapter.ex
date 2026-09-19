@@ -58,6 +58,7 @@ defmodule SymphonyElixir.Opencode.Adapter do
   @impl true
   def start_session(workspace, opts) do
     settings = Keyword.get_lazy(opts, :settings, fn -> Config.settings!().opencode end)
+    settings = workspace_settings(settings, workspace)
     base_url = base_url(settings)
 
     case Client.create_session(base_url, workspace, request_opts(settings, opts)) do
@@ -89,7 +90,7 @@ defmodule SymphonyElixir.Opencode.Adapter do
     request_opts =
       settings
       |> request_opts(opts)
-      |> Keyword.put(:receive_timeout, settings.turn_timeout_ms)
+      |> Keyword.put(:receive_timeout, turn_receive_timeout(settings.turn_timeout_ms))
 
     notify(opts, %{
       event: :session_started,
@@ -98,27 +99,31 @@ defmodule SymphonyElixir.Opencode.Adapter do
     })
 
     case Client.send_message(session.base_url, session.session_id, body, request_opts) do
-      {:ok, message} ->
+      {:ok, message} when is_map(message) ->
         # Without this the orchestrator never learns a turn happened: the
         # dashboard shows 0 tokens and no session for a worker that is running
         # normally, which is indistinguishable from one that is hung.
-        notify(opts, %{
-          event: :turn_completed,
-          timestamp: DateTime.utc_now(),
-          session_id: session.session_id,
-          message: message
-        })
+        case complete_turn(session, message) do
+          {:ok, _turn} = complete ->
+            notify(opts, %{
+              event: :turn_completed,
+              timestamp: DateTime.utc_now(),
+              session_id: session.session_id,
+              message: message
+            })
 
-        complete_turn(session, message)
+            complete
 
-      # run_turn sets the receive timeout to the turn budget, so a read timeout
-      # here is the turn overrunning that budget, not a flaky connection.
-      # Reported as a transport error it classifies transient, and the
-      # orchestrator then spends the whole budget again on a turn that will
-      # overrun again — GH-263 was on course to burn four hours that way.
-      {:error, {:opencode_transport_error, %{reason: :timeout}}} ->
+          {:error, _reason} = failure ->
+            failure
+        end
+
+      # A timed turn's receive timeout is its configured deadline. When the
+      # deadline is disabled, an incidental transport timeout remains transient.
+      {:error, {:opencode_transport_error, %{reason: :timeout}}}
+      when settings.turn_timeout_ms > 0 ->
         {:error,
-         {:turn_failed,
+         {:turn_budget_exhausted,
           %{
             "name" => "TurnBudgetExceeded",
             "data" => %{"turn_timeout_ms" => settings.turn_timeout_ms}
@@ -128,6 +133,9 @@ defmodule SymphonyElixir.Opencode.Adapter do
         {:error, {:response_error, reason}}
     end
   end
+
+  defp turn_receive_timeout(0), do: :infinity
+  defp turn_receive_timeout(timeout_ms), do: timeout_ms
 
   @impl true
   def stop_session(session) do
@@ -199,7 +207,9 @@ defmodule SymphonyElixir.Opencode.Adapter do
   # --- turn completion --------------------------------------------------------
 
   defp complete_turn(session, message) do
-    case Map.get(assistant_message(message), "error") do
+    assistant_message = assistant_message(message)
+
+    case Map.get(assistant_message, "error") || Map.get(assistant_message, :error) do
       nil ->
         {:ok, %{session_id: session.session_id, message: message}}
 
@@ -214,8 +224,7 @@ defmodule SymphonyElixir.Opencode.Adapter do
       is_map(Map.get(update, :info)) -> Map.get(update, :info)
       is_map(Map.get(update, "message")) -> assistant_message(Map.get(update, "message"))
       is_map(Map.get(update, :message)) -> assistant_message(Map.get(update, :message))
-      is_map(update) -> update
-      true -> %{}
+      true -> update
     end
   end
 
@@ -279,6 +288,24 @@ defmodule SymphonyElixir.Opencode.Adapter do
     end
   end
 
+  defp workspace_settings(settings, workspace) do
+    if Map.get(settings, :workspace_runtime, false) do
+      path = Path.join(workspace, ".scratch/opencode.json")
+
+      with {:ok, canonical} <- SymphonyElixir.PathSafety.canonicalize(path),
+           true <- canonical == path,
+           {:ok, content} <- File.read(path),
+           {:ok, %{"version" => 1, "workspace" => ^workspace, "base_url" => url, "password" => password}} <- Jason.decode(content),
+           %URI{scheme: "http", host: "127.0.0.1", port: port} when is_integer(port) <- URI.parse(url) do
+        settings |> Map.put(:base_url, url) |> Map.put(:password, password)
+      else
+        _ -> raise "workspace runtime is missing or invalid: #{workspace}"
+      end
+    else
+      settings
+    end
+  end
+
   defp base_url(%{base_url: base_url}) when is_binary(base_url) and base_url != "",
     do: String.trim_trailing(base_url, "/")
 
@@ -287,7 +314,7 @@ defmodule SymphonyElixir.Opencode.Adapter do
   defp request_opts(settings, opts) do
     [
       receive_timeout: settings.read_timeout_ms,
-      password: System.get_env("OPENCODE_SERVER_PASSWORD"),
+      password: Map.get(settings, :password, System.get_env("OPENCODE_SERVER_PASSWORD")),
       username: System.get_env("OPENCODE_SERVER_USERNAME", "opencode")
     ]
     |> Keyword.merge(Keyword.take(opts, [:request_fun, :receive_timeout]))
