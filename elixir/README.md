@@ -122,11 +122,13 @@ Supported release targets:
 `v*` tags publish all four targets with checksums. A manual workflow run builds the same
 artifacts without creating a release.
 
-The `burrito-nightly` workflow builds each push to `main`, with no scheduled rebuilds.
-After all four platform smoke tests pass, it updates the rolling
-[`nightly` prerelease](https://github.com/openai/symphony/releases/tag/nightly),
-including binaries and checksums. Nightly binaries use a `-nightly` version suffix;
-the release notes identify the source commit. Stable releases remain unchanged.
+The `burrito-nightly` workflow runs on pushes to `main`, with no scheduled rebuilds.
+GitHub may coalesce pending runs in its shared nightly concurrency group, so the
+repository's rolling `nightly` prerelease tracks the newest completed main build
+rather than archiving every intermediate push. After all four platform smoke tests
+pass, the prerelease is updated with binaries and checksums. Nightly binaries use a
+`-nightly` version suffix; the release notes identify the source commit. Stable
+releases remain unchanged.
 
 After downloading the executable for your platform from a release:
 
