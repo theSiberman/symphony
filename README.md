@@ -83,7 +83,7 @@ Child issues use `main` by default. Legacy workflows that still accumulate work
 on a Product Spec branch can opt in with `tracker.child_integration_target: parent`;
 `integration:main` and `integration:parent` provide per-issue overrides before workspace creation.
 An exhausted OpenCode turn budget creates a durable actionable hold instead of
-restarting the same work. Fabula's test runner separately supervises subprocess
+restarting the same work. Deployments can separately supervise subprocess
 inactivity; Symphony's synchronous OpenCode adapter applies a whole-turn budget
 and does not report intermediate progress.
 
