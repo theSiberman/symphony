@@ -84,13 +84,26 @@ defmodule SymphonyElixir.Workspace do
   # These markers exist only while an exhausted-worker hold is being written to
   # the tracker. They also cover failures before a ticket checkout exists.
   @spec record_exception(map(), String.t(), map()) :: :ok | {:error, term()}
-  def record_exception(issue, reason, scope) do
+  def record_exception(issue, reason, scope), do: record_exception(issue, reason, scope, :reporter)
+
+  @spec record_exception(map(), String.t(), map(), :reporter | :operator) :: :ok | {:error, term()}
+  def record_exception(issue, reason, scope, audience) when audience in [:reporter, :operator] do
     with {:ok, directory} <- exception_directory(),
          :ok <- File.mkdir_p(directory) do
       path = Path.join(directory, workspace_key(issue) <> ".json")
 
       with :ok <- validate_local_workspace_path(path, directory) do
-        File.write(path, Jason.encode!(%{id: issue.id, identifier: issue.identifier, reason: reason, scope: scope}), [:sync])
+        File.write(
+          path,
+          Jason.encode!(%{
+            id: issue.id,
+            identifier: issue.identifier,
+            reason: reason,
+            scope: scope,
+            audience: audience
+          }),
+          [:sync]
+        )
       end
     end
   end
@@ -126,7 +139,9 @@ defmodule SymphonyElixir.Workspace do
       with :ok <- validate_local_workspace_path(path, directory),
            {:ok, content} <- File.read(path),
            {:ok, %{"id" => id, "identifier" => identifier, "reason" => reason} = entry} <- Jason.decode(content),
-           true <- is_binary(id) and is_binary(identifier) and is_binary(reason) do
+           true <-
+             is_binary(id) and is_binary(identifier) and is_binary(reason) and
+               Map.get(entry, "audience", "reporter") in ["reporter", "operator"] do
         {:cont, {:ok, [entry | entries]}}
       else
         error -> {:halt, {:error, {:pending_exception_unreadable, path, error}}}

@@ -94,8 +94,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.issue_url == "https://example.org/issues/MT-188"
 
     assert snapshot_entry.integration_target == %{
-             kind: :parent_spec,
-             branch: "spec/225-*",
+             kind: :main,
+             branch: "main",
              parent_number: 225
            }
 

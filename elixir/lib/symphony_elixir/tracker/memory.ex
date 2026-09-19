@@ -31,12 +31,17 @@ defmodule SymphonyElixir.Tracker.Memory do
   end
 
   @spec pause_issue(Issue.t(), String.t()) :: :ok
-  def pause_issue(issue, _reason) do
+  def pause_issue(issue, reason), do: pause_issue(issue, reason, :reporter)
+
+  @spec pause_issue(Issue.t(), String.t(), :reporter | :operator) :: :ok
+  def pause_issue(issue, _reason, audience) when audience in [:reporter, :operator] do
+    hold = if audience == :operator, do: "needs-triage", else: "needs-info"
+
     Application.put_env(
       :symphony_elixir,
       :memory_tracker_issues,
       Enum.map(issue_entries(), fn current ->
-        if current.id == issue.id, do: %{current | state: "needs-info", labels: ["needs-info"]}, else: current
+        if current.id == issue.id, do: %{current | state: hold, labels: [hold]}, else: current
       end)
     )
 

@@ -11,9 +11,9 @@ to exactly one Product Spec.
 
 ## Integration target
 
-The destination into which a work item's changes must merge. A workflow chooses whether a tracer
-targets its parent Product Spec or `main`; an unrelated standalone work item's integration target
-is always `main`.
+The destination into which a work item's changes must merge. A tracer targets `main` by default;
+a legacy workflow or explicit issue label can instead opt into its parent Product Spec. An
+unrelated standalone work item's integration target is always `main`.
 
 ## Integration branch
 

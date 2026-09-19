@@ -1076,7 +1076,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.read!(Path.join(workspace, "after_create.log")) == "after_create\n"
 
       assert File.read!(Path.join(workspace, "hook-env.log")) ==
-               "42\tMT-HOOKS\t225\tspec/225-*\n"
+               "42\tMT-HOOKS\t225\tmain\n"
 
       assert {:ok, _workspace} = Workspace.create_for_issue(issue)
       assert length(String.split(String.trim(File.read!(after_create_counter)), "\n")) == 1

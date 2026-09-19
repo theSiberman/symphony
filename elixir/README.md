@@ -26,8 +26,10 @@ gets the next slot instead of being starved by a continuation. Only running work
 consume execution slots. Normal continuation resets the
 abnormal-failure count; `agent.max_abnormal_retries` defaults to three. Exhaustion
 preserves work and records a pending exception under the workspace root before
-asking the tracker to hold the issue. GitHub uses `needs-info` and removes queue
-labels. Pending writes replay before dispatch, including after restart; the marker
+asking the tracker to hold the issue. GitHub uses `needs-info` for exhausted work
+that needs reporter input and `needs-triage` for deterministic infrastructure
+configuration failures; both remove queue labels. Pending writes replay before
+dispatch, including after restart; the marker
 is removed only after the tracker confirms the hold. Markers carry their original
 non-secret repository identity; a scope change cannot redirect a pending hold.
 Unreadable or mismatched markers block
@@ -216,11 +218,14 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
-- A child issue normally integrates into its parent's `spec/<number>-*` branch. Set
-  `tracker.child_integration_target: main` for repositories whose child issues land independently
-  on `main`. The `integration:main` and `integration:parent` labels override that workflow default
-  per issue; Symphony keeps the parent number in hook metadata. Apply an override before dispatch,
+- A child issue integrates into `main` by default. Legacy repositories can set
+  `tracker.child_integration_target: parent` to resolve a child to its parent's
+  `spec/<number>-*` branch. The `integration:main` and `integration:parent` labels override that
+  workflow default per issue; Symphony keeps the parent number in hook metadata. Apply an override before dispatch,
   since an existing workspace retains its original integration commit.
+- Workspace hooks can return exit status `78` (`EX_CONFIG`) for deterministic infrastructure
+  configuration failures. Symphony does not spend the worker retry budget on those failures and,
+  on GitHub, parks the ticket in `needs-triage` for an operator rather than `needs-info`.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or

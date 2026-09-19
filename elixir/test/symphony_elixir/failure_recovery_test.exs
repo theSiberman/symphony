@@ -12,7 +12,7 @@ defmodule SymphonyElixir.FailureRecoveryTest do
       end)
     end
 
-    def request(method, path, _params, _body, _opts) do
+    def request(method, path, _params, body, _opts) do
       block_request_until_test_allows_it()
 
       Agent.get_and_update(__MODULE__, fn state ->
@@ -21,7 +21,7 @@ defmodule SymphonyElixir.FailureRecoveryTest do
         if state.pause_error do
           {{:ok, %{status: 503, body: %{}}}, state}
         else
-          issues = updated_issues(state.issues, method, path)
+          issues = updated_issues(state.issues, method, path, body)
           {{:ok, %{status: 200, body: %{}}}, %{state | issues: issues}}
         end
       end)
@@ -41,13 +41,19 @@ defmodule SymphonyElixir.FailureRecoveryTest do
       end
     end
 
-    defp updated_issues(issues, "DELETE", path) do
-      if String.ends_with?(path, "/ready-for-agent"),
-        do: Enum.map(issues, &%{&1 | state: "needs-info", labels: ["needs-info"]}),
+    defp updated_issues(issues, "POST", path, %{"labels" => [label]}) do
+      if String.ends_with?(path, "/labels"),
+        do: Enum.map(issues, &%{&1 | state: label, labels: Enum.uniq([label | &1.labels])}),
         else: issues
     end
 
-    defp updated_issues(issues, _method, _path), do: issues
+    defp updated_issues(issues, "DELETE", path, _body) do
+      if String.ends_with?(path, "/ready-for-agent"),
+        do: Enum.map(issues, &%{&1 | labels: List.delete(&1.labels, "ready-for-agent")}),
+        else: issues
+    end
+
+    defp updated_issues(issues, _method, _path, _body), do: issues
   end
 
   setup do
@@ -152,6 +158,32 @@ defmodule SymphonyElixir.FailureRecoveryTest do
     send(restarted, :run_poll_cycle)
     eventually(fn -> Workspace.pending_exceptions() == {:ok, []} end)
     assert [%Issue{state: "needs-info"}] = Agent.get(OfflineGitHub, & &1.issues)
+    refute File.exists?(Path.join(root, "worker-started"))
+  end
+
+  test "an integration selector configuration failure fails fast and survives restart for an operator", %{
+    root: root,
+    issue: issue
+  } do
+    update(%{pause_error: true})
+    pid = start_supervised!({Orchestrator, name: SelectorConfigurationRecovery})
+
+    failure =
+      {:agent_failed, {:workspace_hook_failed, "after_create", 78, "integration target selector spec/496-* resolved 0 branches; expected exactly one"}}
+
+    crash(pid, issue, 0, failure)
+    eventually(fn -> :sys.get_state(pid).running == %{} end)
+    assert :sys.get_state(pid).retry_attempts == %{}
+    assert {:ok, [marker]} = Workspace.pending_exceptions()
+    assert marker["audience"] == "operator"
+    assert marker["reason"] =~ "integration target selector"
+
+    stop_supervised!(Orchestrator)
+    update(%{pause_error: false})
+    restarted = start_supervised!({Orchestrator, name: SelectorConfigurationRecovery})
+    send(restarted, :run_poll_cycle)
+    eventually(fn -> Workspace.pending_exceptions() == {:ok, []} end)
+    assert [%Issue{state: "needs-triage"}] = Agent.get(OfflineGitHub, & &1.issues)
     refute File.exists?(Path.join(root, "worker-started"))
   end
 

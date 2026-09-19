@@ -288,22 +288,35 @@ defmodule SymphonyElixir.Orchestrator do
 
     error = "agent exited: #{inspect(reason)}"
 
-    if budget_exhausted?(reason) or next_attempt > Config.settings!().agent.max_abnormal_retries do
-      prefix = if budget_exhausted?(reason), do: "execution budget exhausted", else: "retry limit reached"
-      error = "#{prefix}: #{error}"
-      state = block_issue_from_entry(state, issue_id, running_entry, error)
-      state = put_in(state.blocked[issue_id][:pending_exception], error)
-      replay_pending_exceptions(state)
-    else
-      schedule_issue_retry(state, issue_id, next_attempt, %{
-        identifier: running_entry.identifier,
-        issue_url: running_entry.issue.url,
-        error: error,
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
-      })
+    cond do
+      operator_failure?(reason) ->
+        preserve_worker_exception(state, issue_id, running_entry, error, :operator)
+
+      budget_exhausted?(reason) or next_attempt > Config.settings!().agent.max_abnormal_retries ->
+        prefix = if budget_exhausted?(reason), do: "execution budget exhausted", else: "retry limit reached"
+        error = "#{prefix}: #{error}"
+        preserve_worker_exception(state, issue_id, running_entry, error, :reporter)
+
+      true ->
+        schedule_issue_retry(state, issue_id, next_attempt, %{
+          identifier: running_entry.identifier,
+          issue_url: running_entry.issue.url,
+          error: error,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
     end
   end
+
+  defp preserve_worker_exception(state, issue_id, running_entry, error, audience) do
+    state = block_issue_from_entry(state, issue_id, running_entry, error)
+    state = put_in(state.blocked[issue_id][:pending_exception], error)
+    state = put_in(state.blocked[issue_id][:pending_exception_audience], audience)
+    replay_pending_exceptions(state)
+  end
+
+  defp operator_failure?({:agent_failed, {:workspace_hook_failed, _hook, 78, _output}}), do: true
+  defp operator_failure?(_reason), do: false
 
   defp transient_failure?({:agent_failed, {:issue_state_refresh_failed, _detail}}), do: true
 
@@ -322,7 +335,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp replay_pending_exceptions(state) do
     writes =
       for {_id, entry} <- state.blocked, entry[:pending_exception] != nil do
-        Workspace.record_exception(entry.issue, entry.pending_exception, state.exception_scope)
+        Workspace.record_exception(
+          entry.issue,
+          entry.pending_exception,
+          state.exception_scope,
+          Map.get(entry, :pending_exception_audience, :reporter)
+        )
       end
 
     with nil <- Enum.find(writes, &(&1 != :ok)),
@@ -345,11 +363,12 @@ defmodule SymphonyElixir.Orchestrator do
        else: {:error, :pending_exception_tracker_scope_mismatch}
   end
 
-  defp replay_exception(%{"id" => id, "identifier" => identifier, "reason" => reason}, state) do
+  defp replay_exception(%{"id" => id, "identifier" => identifier, "reason" => reason} = pending, state) do
     issue = %Issue{id: id, identifier: identifier}
     state = block_issue_from_entry(state, id, %{issue: issue, identifier: identifier}, reason)
+    audience = if pending["audience"] == "operator", do: :operator, else: :reporter
 
-    case Tracker.pause_issue(issue, reason) do
+    case Tracker.pause_issue(issue, reason, audience) do
       :ok ->
         case Workspace.clear_exception(issue) do
           :ok -> state

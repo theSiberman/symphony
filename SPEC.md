@@ -396,7 +396,7 @@ Fields:
   - Matching ignores case and surrounding whitespace.
   - A blank configured label matches no issue.
 - `child_integration_target` (`parent` or `main`)
-  - Default: `parent`.
+  - Default: `main`.
   - `parent` routes a native child issue to the parent branch selector
     `spec/<parent-number>-*`; `main` routes it to `main` while preserving parent metadata.
   - The issue labels `integration:main` and `integration:parent` override the configured default.
@@ -2395,8 +2395,10 @@ execution slots. Due retries rejoin ordinary sorted selection and pass the same
 host admission as new work. Normal completion resets abnormal attempts. The
 `agent.max_abnormal_retries` limit defaults to three; exhausted candidates stay
 preserved. A pending exception marker under the workspace root survives restart
-and replays before dispatch until the tracker confirms the hold (GitHub:
-`needs-info`, queue labels removed). Markers bind the original non-secret tracker
+and replays before dispatch until the tracker confirms the hold. Retry exhaustion
+uses a reporter-facing hold (GitHub: `needs-info`); a workspace hook exit status
+`78` (`EX_CONFIG`) is a deterministic operator failure, bypasses retries, and uses
+an operator-facing hold (GitHub: `needs-triage`). Both remove queue labels. Markers bind the original non-secret tracker
 scope; unreadable markers or a scope mismatch stop admission visibly.
 Temporary provider and tracker errors retain the abnormal count and always have
 positive backoff; host waiting itself never mutates ticket state.

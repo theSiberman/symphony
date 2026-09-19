@@ -29,8 +29,10 @@ gets the next slot instead of being starved by a continuation. Only running work
 consume execution slots. Normal continuation resets the
 abnormal-failure count; `agent.max_abnormal_retries` defaults to three. Exhaustion
 preserves work and records a pending exception under the workspace root before
-asking the tracker to hold the issue. GitHub uses `needs-info` and removes queue
-labels. Pending writes replay before dispatch, including after restart; the marker
+asking the tracker to hold the issue. GitHub uses `needs-info` for exhausted work
+that needs reporter input and `needs-triage` for deterministic infrastructure
+configuration failures; both remove queue labels. Pending writes replay before
+dispatch, including after restart; the marker
 is removed only after the tracker confirms the hold. Markers carry their original
 non-secret repository identity; a scope change cannot redirect a pending hold.
 Unreadable or mismatched markers block
@@ -77,8 +79,8 @@ and current workers, retaining useful build output while reserving future growth
 Explicit provisioning identities distinguish resumable workspaces from partial
 checkouts. The Elixir implementation also supports deployment-owned per-workspace
 OpenCode endpoints and retries failed workspace cleanup independently of delivery.
-Child issues normally use a parent integration branch. A workflow can set
-`tracker.child_integration_target: main` when its delivery model lands child issues independently;
+Child issues use `main` by default. Legacy workflows that still accumulate work
+on a Product Spec branch can opt in with `tracker.child_integration_target: parent`;
 `integration:main` and `integration:parent` provide per-issue overrides before workspace creation.
 An exhausted OpenCode turn budget creates a durable actionable hold instead of
 restarting the same work. Fabula's test runner separately supervises subprocess

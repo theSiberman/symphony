@@ -14,7 +14,7 @@ defmodule SymphonyElixir.IntegrationTarget do
   @type child_policy :: :main | :parent_spec | String.t()
 
   @spec for_issue(Issue.t() | map() | term(), child_policy()) :: t()
-  def for_issue(issue, child_policy \\ :parent_spec) do
+  def for_issue(issue, child_policy \\ :main) do
     labels = normalized_labels(issue)
 
     cond do
