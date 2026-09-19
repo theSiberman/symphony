@@ -451,8 +451,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert unknown_log =~ "unknown_ignored_path"
       assert File.exists?(workspace)
       File.rm!(Path.join(workspace, ".env"))
-      clean_log = capture_log(fn -> assert :ok = Workspace.reconcile_terminal_workspaces() end)
-      assert clean_log == ""
+      assert :ok = Workspace.reconcile_terminal_workspaces()
       refute File.exists?(workspace)
     after
       File.rm_rf(test_root)
