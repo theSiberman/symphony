@@ -200,7 +200,8 @@ defmodule SymphonyElixir.AgentRunner do
   defp redispatch_transition?(_previous_state, _refreshed_state), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    tracker = Config.settings!().tracker
+    Issue.routable?(issue, tracker.required_labels, tracker.excluded_labels)
   end
 
   defp selected_worker_host(nil, []), do: nil

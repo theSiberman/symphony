@@ -1128,7 +1128,11 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(id) and is_binary(state) do
     active_issue_state?(state, active_state_set()) and
       not terminal_issue_state?(state, terminal_state_set()) and
-      Issue.routable?(%{issue | dispatchable: true}, Config.settings!().tracker.required_labels)
+      Issue.routable?(
+        %{issue | dispatchable: true},
+        Config.settings!().tracker.required_labels,
+        Config.settings!().tracker.excluded_labels
+      )
   end
 
   defp priority_donor?(_issue), do: false
@@ -1292,7 +1296,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    tracker = Config.settings!().tracker
+    Issue.routable?(issue, tracker.required_labels, tracker.excluded_labels)
   end
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do

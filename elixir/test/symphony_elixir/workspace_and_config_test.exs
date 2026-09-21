@@ -546,6 +546,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute Issue.routable?(%{issue | dispatchable: false}, ["symphony"])
   end
 
+  test "tracker issue routing rejects every configured excluded label" do
+    issue = %Issue{labels: ["ready-for-agent", " Requires:Pen "], dispatchable: true}
+
+    refute Issue.routable?(issue, ["ready-for-agent"], ["requires:pen"])
+    refute Issue.routable?(issue, ["ready-for-agent"], ["REQUIRES:PEN", "manual-only"])
+    assert Issue.routable?(issue, ["ready-for-agent"], ["manual-only"])
+    assert Issue.routable?(%{issue | labels: ["ready-for-agent"]}, ["ready-for-agent"], ["requires:pen"])
+  end
+
   test "linear client normalizes blockers from inverse relations" do
     raw_issue = %{
       "id" => "issue-1",
@@ -941,7 +950,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "issue without every required label is not dispatch-eligible" do
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_required_labels: ["symphony", "javascript"]
+      tracker_required_labels: ["symphony", "javascript"],
+      tracker_excluded_labels: ["requires:pen"]
     )
 
     state = %Orchestrator.State{
@@ -963,6 +973,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
     assert Orchestrator.should_dispatch_issue_for_test(%{issue | labels: ["Symphony", "JavaScript"]}, state)
+
+    refute Orchestrator.should_dispatch_issue_for_test(
+             %{issue | labels: ["Symphony", "JavaScript", "Requires:Pen"]},
+             state
+           )
   end
 
   test "provider-marked ready issue remains dispatch-eligible" do
@@ -1252,6 +1267,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
     assert config.tracker.required_labels == []
+    assert config.tracker.excluded_labels == []
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
@@ -1288,6 +1304,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     )
 
     assert Config.settings!().tracker.required_labels == ["symphony", "javascript"]
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_excluded_labels: [" Requires:Pen ", "REQUIRES:PEN", "Manual-Only"]
+    )
+
+    assert Config.settings!().tracker.excluded_labels == ["requires:pen", "manual-only"]
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: [" "])
     assert Config.settings!().tracker.required_labels == [""]

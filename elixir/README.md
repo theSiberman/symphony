@@ -181,6 +181,9 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- `tracker.excluded_labels` is optional. When set, an issue carrying any
+  configured label is neither dispatched nor continued. Matching has the same
+  case and whitespace behavior as `required_labels`.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -264,7 +267,8 @@ codex:
   `$VAR`), required `project_slug`, and optional `assignee` (a Linear user ID or `me`,
   defaulting to `LINEAR_ASSIGNEE`).
   The legacy flat `tracker.endpoint`, `api_key`, `project_slug`, and `assignee` aliases remain
-  supported. `required_labels`, `active_states`, and `terminal_states` stay under `tracker`.
+  supported. `required_labels`, `excluded_labels`, `active_states`, and `terminal_states` stay
+  under `tracker`.
 - Scope and paging: candidate reads filter the configured project slug and requested state names,
   following Linear pages of 50. ID refreshes are also project-scoped and batch up to 50 IDs. Empty
   state/ID lists return `{:ok, []}` without a Linear request.

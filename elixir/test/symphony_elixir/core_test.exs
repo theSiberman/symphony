@@ -902,6 +902,57 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
+  test "reconcile stops running issue when an excluded label is added" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels: ["ready-for-agent"],
+      tracker_excluded_labels: ["requires:pen"]
+    )
+
+    issue_id = "issue-requires-pen"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "GH-635",
+          issue: %Issue{
+            id: issue_id,
+            identifier: "GH-635",
+            state: "In Progress",
+            labels: ["ready-for-agent"]
+          },
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "GH-635",
+      state: "In Progress",
+      title: "Pen-only active issue",
+      labels: ["ready-for-agent", "requires:pen"],
+      dispatchable: true
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    refute Process.alive?(agent_pid)
+  end
+
   test "reconcile releases a blocked issue when a required label is removed" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
 
@@ -1028,6 +1079,28 @@ defmodule SymphonyElixir.CoreTest do
 
     refreshed_issue = %{issue | labels: []}
     fetcher = fn ["issue-label-continuation"] -> {:ok, [refreshed_issue]} end
+
+    assert {:done, ^refreshed_issue} =
+             AgentRunner.continue_with_issue_for_test(issue, fetcher)
+  end
+
+  test "agent runner does not continue after an excluded label is added" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels: ["ready-for-agent"],
+      tracker_excluded_labels: ["requires:pen"]
+    )
+
+    issue = %Issue{
+      id: "issue-pen-continuation",
+      identifier: "GH-635",
+      title: "Stop for Pen",
+      state: "In Progress",
+      labels: ["ready-for-agent"],
+      dispatchable: true
+    }
+
+    refreshed_issue = %{issue | labels: ["ready-for-agent", "requires:pen"]}
+    fetcher = fn ["issue-pen-continuation"] -> {:ok, [refreshed_issue]} end
 
     assert {:done, ^refreshed_issue} =
              AgentRunner.continue_with_issue_for_test(issue, fetcher)

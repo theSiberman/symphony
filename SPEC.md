@@ -395,6 +395,10 @@ Fields:
   - An issue MUST contain every configured label to dispatch or continue.
   - Matching ignores case and surrounding whitespace.
   - A blank configured label matches no issue.
+- `excluded_labels` (list of strings)
+  - Default: `[]`.
+  - An issue MUST contain none of the configured labels to dispatch or continue.
+  - Matching ignores case and surrounding whitespace.
 - `child_integration_target` (`parent` or `main`)
   - Default: `main`.
   - `parent` routes a native child issue to the parent branch selector
@@ -623,6 +627,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.kind`: string, REQUIRED, selects one supported adapter
 - `tracker.provider`: object, default `{}`, adapter-owned endpoint/scope/auth settings
 - `tracker.required_labels`: list of strings, default `[]`
+- `tracker.excluded_labels`: list of strings, default `[]`
 - `tracker.active_states`: list of provider-native state names, adapter-defined default
 - `tracker.terminal_states`: list of provider-native state names, adapter-defined default
 - `polling.interval_ms`: integer, default `30000`
@@ -774,15 +779,17 @@ An issue is dispatch-eligible only if all are true:
 - It has `id`, `identifier`, `title`, and `state`.
 - Its state is in `active_states` and not in `terminal_states`.
 - Its adapter-provided `dispatchable` value is `true`.
-- It contains every label in `tracker.required_labels`.
+- It contains every label in `tracker.required_labels` and no label in
+  `tracker.excluded_labels`.
 - It is not already in `running`.
 - It is not already in `claimed`.
 - Global concurrency slots are available.
 - Per-state concurrency slots are available.
 
 For refresh and continuation checks, `issue_routable(issue)` means only that adapter-provided
-`dispatchable` is true and all `tracker.required_labels` match. State, claims, and concurrency are
-checked separately by the surrounding algorithm.
+`dispatchable` is true, all `tracker.required_labels` match, and no
+`tracker.excluded_labels` match. State, claims, and concurrency are checked separately by the
+surrounding algorithm.
 
 Original sorting rank (stable intent):
 
@@ -1231,7 +1238,8 @@ An implementation MUST support these adapter operations:
      cleanup.
    - When used for candidate polling, include active scoped issues even when
      `dispatchable=false`; the scheduler owns that final filter.
-   - The orchestrator applies `required_labels`, `dispatchable`, claims, retries, and concurrency
+   - The orchestrator applies `required_labels`, `excluded_labels`, `dispatchable`, claims,
+     retries, and concurrency
      after normalization.
    - An empty `state_names` list MUST return an empty result without a provider request.
 

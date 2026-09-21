@@ -57,6 +57,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:provider, :map, default: %{})
       field(:secret_environment_names, {:array, :string}, default: [])
       field(:required_labels, {:array, :string}, default: [])
+      field(:excluded_labels, {:array, :string}, default: [])
       field(:active_states, {:array, :string})
       field(:terminal_states, {:array, :string})
     end
@@ -75,6 +76,7 @@ defmodule SymphonyElixir.Config.Schema do
           :child_integration_target,
           :provider,
           :required_labels,
+          :excluded_labels,
           :active_states,
           :terminal_states
         ],
@@ -82,6 +84,11 @@ defmodule SymphonyElixir.Config.Schema do
       )
       |> validate_inclusion(:child_integration_target, ["main", "parent"])
       |> update_change(:required_labels, fn labels ->
+        labels
+        |> Enum.map(&(String.trim(&1) |> String.downcase()))
+        |> Enum.uniq()
+      end)
+      |> update_change(:excluded_labels, fn labels ->
         labels
         |> Enum.map(&(String.trim(&1) |> String.downcase()))
         |> Enum.uniq()

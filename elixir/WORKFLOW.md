@@ -6,6 +6,7 @@ tracker:
   # Child issues target their parent spec branch unless this is set to main.
   child_integration_target: parent
   required_labels: []
+  excluded_labels: []
   active_states:
     - Todo
     - In Progress
