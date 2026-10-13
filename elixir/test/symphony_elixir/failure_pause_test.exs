@@ -65,6 +65,15 @@ defmodule SymphonyElixir.FailurePauseTest do
     refute body =~ "reporter"
   end
 
+  test "captured hold settings keep mutations on the original repository after reload", %{issue: issue} do
+    settings = Config.settings!().tracker
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
+    assert :ok = Tracker.pause_issue(issue, "worker OOM", :reporter, settings)
+    assert_receive {:request, "POST", "/repos/fixture/offline/issues/17/labels", _}
+    assert_receive {:request, "DELETE", "/repos/fixture/offline/issues/17/labels/ready-for-agent", nil}
+    assert_receive {:request, "POST", "/repos/fixture/offline/issues/17/comments", _}
+  end
+
   test "a failed exception write is visible and stops further mutation", %{issue: issue} do
     Process.put({:status, "POST"}, 503)
     assert {:error, {:pause_failed, _}} = Tracker.pause_issue(issue, "worker OOM")
@@ -86,6 +95,9 @@ defmodule SymphonyElixir.FailurePauseTest do
 
     assert [%Issue{state: "needs-info", labels: ["needs-info"]}] =
              Application.fetch_env!(:symphony_elixir, :memory_tracker_issues)
+
+    assert :ok = Tracker.pause_issue(issue, "operator repair", :operator, %{kind: "memory"})
+    assert [%Issue{state: "needs-triage"}] = Application.fetch_env!(:symphony_elixir, :memory_tracker_issues)
   end
 
   test "trackers without hold support report both pause entry points as unsupported", %{issue: issue} do
@@ -95,5 +107,8 @@ defmodule SymphonyElixir.FailurePauseTest do
 
     assert {:error, :tracker_pause_unsupported} =
              Tracker.pause_issue(issue, "broken provisioning policy", :operator)
+
+    assert {:error, :tracker_pause_unsupported} =
+             Tracker.pause_issue(issue, "broken provisioning policy", :operator, Config.settings!().tracker)
   end
 end

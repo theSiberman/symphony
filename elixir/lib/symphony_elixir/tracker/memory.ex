@@ -33,6 +33,9 @@ defmodule SymphonyElixir.Tracker.Memory do
   @spec pause_issue(Issue.t(), String.t()) :: :ok
   def pause_issue(issue, reason), do: pause_issue(issue, reason, :reporter)
 
+  @spec pause_issue(Issue.t(), String.t(), :reporter | :operator, map()) :: :ok
+  def pause_issue(issue, reason, audience, _settings), do: pause_issue(issue, reason, audience)
+
   @spec pause_issue(Issue.t(), String.t(), :reporter | :operator) :: :ok
   def pause_issue(issue, _reason, audience) when audience in [:reporter, :operator] do
     hold = if audience == :operator, do: "needs-triage", else: "needs-info"

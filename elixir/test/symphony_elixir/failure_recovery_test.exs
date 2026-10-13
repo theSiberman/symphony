@@ -206,6 +206,7 @@ defmodule SymphonyElixir.FailureRecoveryTest do
     pid = start_supervised!({Orchestrator, name: ScopedExceptionRecovery})
     crash(pid, issue, 3, :boom)
     eventually(fn -> match?({:ok, [_]}, Workspace.pending_exceptions()) end)
+    eventually(fn -> :sys.get_state(pid).tracker_task == nil end)
     {:ok, [marker]} = Workspace.pending_exceptions()
     assert marker["scope"] == %{"kind" => "github", "api_url" => "https://api.github.com", "repo" => "fixture/offline"}
     refute Jason.encode!(marker) =~ "fixture-token"
@@ -227,7 +228,9 @@ defmodule SymphonyElixir.FailureRecoveryTest do
     update(%{request_gate: self()})
     pid = start_supervised!({Orchestrator, name: ExceptionRecovery})
     crash(pid, issue, 3, :boom)
-    assert_receive {:offline_tracker_request_started, ^pid}, 1_000
+    assert_receive {:offline_tracker_request_started, request_pid}, 1_000
+    refute request_pid == pid
+    assert %{running: [], blocked: [_]} = GenServer.call(pid, :snapshot, 100)
     assert {:ok, [_]} = Workspace.pending_exceptions()
     requests_before_restart = Agent.get(OfflineGitHub, & &1.requests)
     assert requests_before_restart == 0

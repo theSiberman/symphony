@@ -41,7 +41,12 @@ defmodule SymphonyElixir.GitHub.Adapter do
   @spec pause_issue(SymphonyElixir.Tracker.Issue.t(), String.t(), :reporter | :operator) ::
           :ok | {:error, term()}
   def pause_issue(issue, reason, audience) when audience in [:reporter, :operator] do
-    settings = SymphonyElixir.Config.settings!().tracker
+    pause_issue(issue, reason, audience, SymphonyElixir.Config.settings!().tracker)
+  end
+
+  @spec pause_issue(SymphonyElixir.Tracker.Issue.t(), String.t(), :reporter | :operator, map()) ::
+          :ok | {:error, term()}
+  def pause_issue(issue, reason, audience, settings) when audience in [:reporter, :operator] do
     {_url, repo} = Client.repository_identity(settings)
     path = "/repos/#{repo}/issues/#{issue.id}"
     client = client_module()

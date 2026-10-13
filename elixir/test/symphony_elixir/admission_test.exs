@@ -126,6 +126,7 @@ defmodule SymphonyElixir.AdmissionTest do
     configure(command, hook_after_create: "touch '#{started}'; exit 1")
     pid = start_supervised!({Orchestrator, name: AdmissionRecovery})
     send(pid, :run_poll_cycle)
+    eventually(fn -> match?({:waiting, _}, :sys.get_state(pid).admission) end)
     assert %{admission: %{status: "waiting"}} = GenServer.call(pid, :snapshot, 100)
     eventually(fn -> :sys.get_state(pid).admission == {:waiting, "disk-shortage"} end)
     assert {:ok, [^issue]} = Tracker.fetch_issues_by_states(["Todo"])
@@ -404,6 +405,7 @@ defmodule SymphonyElixir.AdmissionTest do
     send(child, :fail)
     eventually(fn -> :sys.get_state(pid).running == %{} end)
     assert :sys.get_state(pid).retry_attempts == %{}
+    eventually(fn -> match?({:ok, [%Issue{state: "needs-info"}]}, Tracker.fetch_issues_by_ids([issue.id])) end)
     assert {:ok, [%Issue{state: "needs-info"}]} = Tracker.fetch_issues_by_ids([issue.id])
     stop_supervised!(Orchestrator)
     restarted = start_supervised!({Orchestrator, name: AdmissionFailures})

@@ -166,6 +166,7 @@ defmodule SymphonyElixir.RunningLabelsTest do
     assert labels() == MapSet.new([321])
     Process.exit(worker, :kill)
     eventually(fn -> :sys.get_state(LabelOrchestrator).running == %{} end)
+    eventually(fn -> labels() == MapSet.new() end)
     assert labels() == MapSet.new()
     assert Map.has_key?(:sys.get_state(LabelOrchestrator).retry_attempts, "321")
 
@@ -212,7 +213,11 @@ defmodule SymphonyElixir.RunningLabelsTest do
 
   defp poll do
     send(LabelOrchestrator, :run_poll_cycle)
-    :sys.get_state(LabelOrchestrator)
+
+    eventually(fn ->
+      state = :sys.get_state(LabelOrchestrator)
+      state.tracker_task == nil and state.label_task == nil and not state.poll_check_in_progress
+    end)
   end
 
   defp add_worker(id) do

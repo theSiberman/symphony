@@ -13,6 +13,15 @@ the best queue position of the active tickets waiting on it, including through
 dependency chains. Ranking is recalculated each poll without interrupting running
 workers or admitting paused, excluded or still-blocked tickets.
 
+Tracker polls, dispatch revalidation, pending holds, and workspace discovery run
+in a monitored task while the scheduler continues processing worker events and
+serving status calls. Concurrent refreshes coalesce into one follow-up poll.
+Orderly scheduler shutdown cancels its pending I/O before replacement.
+Results apply only to the current workflow and matching worker/retry ownership;
+fresh dispatch validation still runs immediately before admission. Running-label
+writes are serialized separately and reconcile the latest running workers.
+Pending cleanup records are retried only while no worker owns a checkout.
+
 Host admission can be configured with `agent.admission_command`. It runs once
 asynchronously after candidate selection, bounded to 90 seconds (plus a
 five-second process-group kill allowance, using the host `timeout` command).
@@ -220,7 +229,17 @@ Notes:
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
-  `git clone ... .` there, along with any other setup commands you need.
+  `git clone ... .` there, along with any other setup commands you need. Before
+  invoking it, Symphony writes `.symphony-provisioning/<workspace-key>` under the
+  workspace root. Failed or interrupted setup preserves the checkout and marker;
+  retries rerun the hook until it succeeds, then clear the marker before admitting
+  the agent. Make bootstrap hooks resume safely without discarding source or Git
+  history. Existing workspaces without a marker retain their established behavior.
+  Failed local hooks retain full redacted output in `.symphony-hook-logs` under the
+  workspace root; warnings include the transcript path. Tokens from credential
+  environment variables, configured tracker credentials, and common authorization
+  fields are redacted before writing.
+  Failed hooks never trigger automatic deletion of their partial checkout.
 - A child issue integrates into `main` by default. Legacy repositories can set
   `tracker.child_integration_target: parent` to resolve a child to its parent's
   `spec/<number>-*` branch. The `integration:main` and `integration:parent` labels override that

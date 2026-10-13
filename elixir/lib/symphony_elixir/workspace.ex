@@ -160,13 +160,8 @@ defmodule SymphonyElixir.Workspace do
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
-        case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-          :ok ->
-            {:ok, workspace}
-
-          {:error, _reason} = error ->
-            cleanup_failed_new_workspace(workspace, created?, worker_host)
-            error
+        with :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+          {:ok, workspace}
         end
       end
     rescue
@@ -179,7 +174,9 @@ defmodule SymphonyElixir.Workspace do
   defp ensure_workspace(workspace, nil) do
     cond do
       File.dir?(workspace) ->
-        {:ok, workspace, false}
+        with :ok <- validate_provisioning_marker(workspace) do
+          {:ok, workspace, File.exists?(provisioning_path(workspace))}
+        end
 
       File.exists?(workspace) ->
         File.rm_rf!(workspace)
@@ -195,15 +192,15 @@ defmodule SymphonyElixir.Workspace do
       [
         "set -eu",
         remote_shell_assign("workspace", workspace),
-        "if [ -d \"$workspace\" ]; then",
+        ~s{marker="$(dirname "$workspace")/.symphony-provisioning/$(basename "$workspace")"},
+        ~s{if [ -L "$(dirname "$marker")" ] || [ -L "$marker" ]; then exit 1; fi},
+        "if [ -d \"$workspace\" ] && [ ! -e \"$marker\" ]; then",
         "  created=0",
-        "elif [ -e \"$workspace\" ]; then",
-        "  rm -rf \"$workspace\"",
-        "  mkdir -p \"$workspace\"",
-        "  created=1",
         "else",
-        "  mkdir -p \"$workspace\"",
         "  created=1",
+        ~s{  mkdir -p "$(dirname "$marker")"; touch "$marker"},
+        "  if [ -e \"$workspace\" ] && [ ! -d \"$workspace\" ]; then rm -rf \"$workspace\"; fi",
+        "  mkdir -p \"$workspace\"",
         "fi",
         "cd \"$workspace\"",
         "printf '%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$created\" \"$(pwd -P)\""
@@ -224,9 +221,14 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp create_workspace(workspace) do
-    File.rm_rf!(workspace)
-    File.mkdir_p!(workspace)
-    {:ok, workspace, true}
+    marker = provisioning_path(workspace)
+
+    with :ok <- validate_provisioning_marker(workspace),
+         :ok <- File.mkdir_p(Path.dirname(marker)),
+         :ok <- File.write(marker, "pending\n", [:sync]),
+         :ok <- File.mkdir_p(workspace) do
+      {:ok, workspace, true}
+    end
   end
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
@@ -305,6 +307,7 @@ defmodule SymphonyElixir.Workspace do
     case result do
       {:ok, _} ->
         File.rm(cleanup_record_path(workspace))
+        clear_provisioning(workspace, nil)
 
       {:error, reason, _} ->
         persist_cleanup(workspace, reason)
@@ -332,10 +335,11 @@ defmodule SymphonyElixir.Workspace do
   @doc "Retry failed removals only after positive current terminal-state confirmation."
   @spec reconcile_cleanup() :: :ok
   def reconcile_cleanup do
+    settings = Config.settings!()
     records = Config.local_workspace_root() |> Path.join(".symphony-cleanup/*.json") |> Path.wildcard()
 
     if records != [] do
-      states = Config.settings!().tracker.terminal_states
+      states = settings.tracker.terminal_states
 
       case Tracker.fetch_issues_by_states(states) do
         {:ok, issues} ->
@@ -346,7 +350,7 @@ defmodule SymphonyElixir.Workspace do
             |> Enum.filter(&MapSet.member?(terminal_states, String.downcase(&1.state)))
             |> MapSet.new(&Path.join(Config.local_workspace_root(), workspace_key(&1)))
 
-          Enum.each(records, &retry_cleanup(&1, terminal))
+          Enum.each(records, &retry_current_cleanup(&1, terminal, settings))
 
         {:error, reason} ->
           Logger.warning("Preserving pending workspace cleanup reason=#{inspect(reason)}")
@@ -359,7 +363,8 @@ defmodule SymphonyElixir.Workspace do
   @doc "Discovers terminal workspaces left behind after a ticket left the scheduler queue."
   @spec reconcile_terminal_workspaces([map()]) :: :ok
   def reconcile_terminal_workspaces(active_issues \\ []) when is_list(active_issues) do
-    terminal_states = Config.settings!().tracker.terminal_states
+    settings = Config.settings!()
+    terminal_states = settings.tracker.terminal_states
     active_workspaces = MapSet.new(active_issues, &workspace_path_for_issue_key/1)
 
     case Tracker.fetch_issues_by_states(terminal_states) do
@@ -369,13 +374,23 @@ defmodule SymphonyElixir.Workspace do
         issues
         |> Enum.filter(&terminal_issue?(&1, terminal_state_set))
         |> Enum.reject(&MapSet.member?(active_workspaces, workspace_path_for_issue_key(&1)))
-        |> Enum.each(&remove_clean_terminal_workspace/1)
+        |> Enum.each(&remove_current_terminal_workspace(&1, settings))
 
       {:error, reason} ->
         Logger.warning("Skipping terminal workspace reconciliation; failed to fetch terminal issues: #{inspect(reason)}")
     end
 
     :ok
+  end
+
+  defp retry_current_cleanup(record, terminal, settings) do
+    if settings == Config.settings!(), do: retry_cleanup(record, terminal)
+  end
+
+  defp remove_current_terminal_workspace(issue, settings) do
+    # A slow tracker response can cross a workflow reload. Its terminal
+    # observations must never clean a workspace using the new settings.
+    if settings == Config.settings!(), do: remove_clean_terminal_workspace(issue)
   end
 
   defp terminal_issue?(%{state: state}, terminal_states) when is_binary(state),
@@ -659,45 +674,52 @@ defmodule SymphonyElixir.Workspace do
     |> binary_part(0, 16)
   end
 
-  defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-    hooks = Config.settings!().hooks
+  defp provisioning_path(workspace) do
+    Path.join([Path.dirname(workspace), ".symphony-provisioning", Path.basename(workspace)])
+  end
 
-    case created? do
-      true ->
-        case hooks.after_create do
-          nil ->
-            :ok
+  defp validate_provisioning_marker(workspace) do
+    marker = provisioning_path(workspace)
 
-          command ->
-            run_hook(command, workspace, issue_context, "after_create", worker_host)
-        end
-
-      false ->
-        :ok
+    with :ok <- validate_local_workspace_path(marker, Config.local_workspace_root()),
+         {:ok, ^marker} <- PathSafety.canonicalize(marker) do
+      :ok
+    else
+      _ -> {:error, {:workspace_provisioning_marker_unsafe, marker}}
     end
   end
 
-  defp cleanup_failed_new_workspace(_workspace, false, _worker_host), do: :ok
+  defp maybe_run_after_create_hook(_workspace, _issue_context, false, _worker_host), do: :ok
 
-  defp cleanup_failed_new_workspace(workspace, true, nil) do
-    case remove_local_workspace(workspace) do
-      {:ok, _removed} ->
-        :ok
+  defp maybe_run_after_create_hook(workspace, issue_context, true, worker_host) do
+    result =
+      case Config.settings!().hooks.after_create do
+        nil -> :ok
+        command -> run_hook(command, workspace, issue_context, "after_create", worker_host)
+      end
 
-      {:error, reason, path} ->
-        Logger.warning("Failed to remove partial workspace path=#{path} reason=#{inspect(reason)}")
+    # Never remove a partial checkout: its separate Git objects, dirty source,
+    # and failure evidence must survive. The marker makes retries complete the
+    # hook instead of admitting a partially provisioned agent workspace.
+    with :ok <- result do
+      clear_provisioning(workspace, worker_host)
     end
   end
 
-  defp cleanup_failed_new_workspace(workspace, true, worker_host) when is_binary(worker_host) do
-    script = [remote_shell_assign("workspace", workspace), "rm -rf \"$workspace\""] |> Enum.join("\n")
+  defp clear_provisioning(workspace, nil) do
+    with :ok <- validate_provisioning_marker(workspace) do
+      case File.rm(provisioning_path(workspace)) do
+        :ok -> :ok
+        {:error, :enoent} -> :ok
+        {:error, reason} -> {:error, {:workspace_provisioning_marker_failed, reason}}
+      end
+    end
+  end
 
-    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-      {:ok, {_output, 0}} ->
-        :ok
-
-      result ->
-        Logger.warning("Failed to remove partial workspace worker_host=#{worker_host_for_log(worker_host)} result=#{inspect(result)}")
+  defp clear_provisioning(workspace, worker_host) do
+    case run_remote_command(worker_host, "rm -f #{shell_escape(provisioning_path(workspace))}", Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> :ok
+      result -> {:error, {:workspace_provisioning_marker_failed, result}}
     end
   end
 
@@ -770,31 +792,32 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
-    task =
-      Task.async(fn ->
-        System.cmd("sh", ["-lc", command],
-          cd: workspace,
-          stderr_to_stdout: true,
-          env: hook_environment(issue_context)
-        )
-      end)
+    transcript = hook_transcript_path(workspace, hook_name)
+    File.write!(transcript, "")
+    File.chmod!(transcript, 0o600)
 
-    case Task.yield(task, timeout_ms) do
-      {:ok, cmd_result} ->
-        handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
+    task = Task.async(fn -> capture_hook(command, workspace, issue_context, transcript) end)
 
-      nil ->
-        Task.shutdown(task, :brutal_kill)
+    result =
+      case Task.yield(task, timeout_ms) do
+        {:ok, status} ->
+          handle_hook_command_result({File.read!(transcript), status}, workspace, issue_context, hook_name, transcript)
 
-        Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
+        nil ->
+          send(task.pid, :hook_timeout)
+          if Task.yield(task, 100) == nil, do: Task.shutdown(task, :brutal_kill)
+          persist_hook_transcript(transcript, File.read!(transcript))
+          Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms} diagnostics=#{transcript}")
+          {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+      end
 
-        {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
-    end
+    if result == :ok, do: File.rm(transcript)
+    result
   end
 
   defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
     timeout_ms = Config.settings!().hooks.timeout_ms
-    remote_command = hook_environment_script(issue_context) <> "\n" <> command
+    remote_command = hook_environment_script(issue_context) <> "\nexport SYMPHONY_HOOK_TIMEOUT_MS=#{Config.settings!().hooks.timeout_ms}\n" <> command
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
@@ -814,16 +837,95 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp handle_hook_command_result({_output, 0}, _workspace, _issue_id, _hook_name) do
-    :ok
+  defp capture_hook(command, workspace, issue_context, transcript) do
+    port =
+      Port.open({:spawn_executable, System.find_executable("sh")}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        {:args, ["-lc", command]},
+        {:cd, workspace},
+        {:env,
+         Enum.map(hook_environment(issue_context) ++ [{"SYMPHONY_HOOK_TIMEOUT_MS", Integer.to_string(Config.settings!().hooks.timeout_ms)}], fn {key, value} ->
+           {String.to_charlist(key), String.to_charlist(value)}
+         end)}
+      ])
+
+    collect_hook_output(port, transcript, "")
   end
 
-  defp handle_hook_command_result({output, status}, workspace, issue_context, hook_name) do
-    sanitized_output = sanitize_hook_output_for_log(output)
+  defp collect_hook_output(port, transcript, pending) do
+    receive do
+      {^port, {:data, data}} ->
+        lines = String.split(pending <> data, "\n")
+        {complete, [pending]} = Enum.split(lines, -1)
+        if complete != [], do: File.write!(transcript, redact_hook_output(Enum.join(complete, "\n") <> "\n"), [:append])
+        collect_hook_output(port, transcript, pending)
 
-    Logger.warning("Workspace hook failed hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output=#{inspect(sanitized_output)}")
+      {^port, {:exit_status, status}} ->
+        File.write!(transcript, redact_hook_output(pending), [:append, :sync])
+        status
 
-    {:error, {:workspace_hook_failed, hook_name, status, output}}
+      :hook_timeout ->
+        File.write!(transcript, redact_hook_output(pending), [:append, :sync])
+        Port.close(port)
+        :timeout
+    end
+  end
+
+  defp handle_hook_command_result(result, workspace, issue_context, hook_name) do
+    handle_hook_command_result(result, workspace, issue_context, hook_name, nil)
+  end
+
+  defp handle_hook_command_result({_output, 0}, _workspace, _issue_id, _hook_name, _transcript), do: :ok
+
+  defp handle_hook_command_result({output, status}, workspace, issue_context, hook_name, transcript) do
+    transcript = transcript || hook_transcript_path(workspace, hook_name)
+    redacted = persist_hook_transcript(transcript, output)
+    sanitized_output = sanitize_hook_output_for_log(redacted)
+
+    Logger.warning("Workspace hook failed hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} diagnostics=#{transcript} output=#{inspect(sanitized_output)}")
+
+    {:error, {:workspace_hook_failed, hook_name, status, redacted}}
+  end
+
+  defp hook_transcript_path(workspace, hook_name) do
+    directory = Path.join(Config.local_workspace_root(), ".symphony-hook-logs")
+    path = Path.join(directory, "#{Path.basename(workspace)}-#{hook_name}-#{System.system_time(:microsecond)}-#{System.unique_integer([:positive])}.log")
+    :ok = validate_local_workspace_path(path, Config.local_workspace_root())
+    File.mkdir_p!(directory)
+    path
+  end
+
+  defp persist_hook_transcript(path, output) do
+    redacted = redact_hook_output(IO.iodata_to_binary(output))
+    File.write!(path, redacted, [:sync])
+    File.chmod!(path, 0o600)
+    redacted
+  end
+
+  defp redact_hook_output(output) do
+    tracker = Config.settings!().tracker
+
+    environment_secrets =
+      System.get_env()
+      |> Enum.filter(fn {key, value} ->
+        String.match?(key, ~r/(TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|CREDENTIAL)/i) and byte_size(value) >= 4
+      end)
+      |> Enum.map(fn {_key, value} -> value end)
+
+    output =
+      [tracker.api_key, tracker.provider["token"] | environment_secrets]
+      |> Enum.filter(&is_binary/1)
+      |> Enum.flat_map(fn value -> [value | String.split(value, "\n")] end)
+      |> Enum.filter(&(byte_size(&1) >= 4))
+      |> Enum.uniq()
+      |> Enum.sort_by(&(-byte_size(&1)))
+      |> Enum.reduce(output, fn value, result -> String.replace(result, value, "[REDACTED]") end)
+
+    output
+    |> String.replace(~r/((?:authorization|_authToken|password|api[_-]?key|access[_-]?token)\s*[:=]\s*)(?:Bearer\s+|Basic\s+)?[^\s"']+/i, "\\1[REDACTED]")
+    |> String.replace(~r{(https?://)[^/@\s]+:[^/@\s]+@}, "\\1[REDACTED]@")
   end
 
   defp sanitize_hook_output_for_log(output, max_bytes \\ 2_048) do

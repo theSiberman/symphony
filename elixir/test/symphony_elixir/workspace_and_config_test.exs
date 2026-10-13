@@ -324,11 +324,112 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
                Workspace.create_for_issue("MT-FAIL-RETRY")
 
+      partial = Path.join(workspace_root, "MT-FAIL-RETRY/partial.txt")
+      assert File.read!(partial) == "partial"
+
       assert {:ok, workspace} = Workspace.create_for_issue("MT-FAIL-RETRY")
       assert File.read!(Path.join(workspace, "READY")) == "ready"
+      assert File.read!(partial) == "partial"
+      assert {:ok, ^workspace} = Workspace.create_for_issue("MT-FAIL-RETRY")
       assert String.split(String.trim(File.read!(attempt_log)), "\n") == ["attempt", "attempt"]
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  test "failed hooks retain their complete redacted transcript outside the checkout" do
+    root = Path.join(System.tmp_dir!(), "symphony-hook-evidence-#{System.unique_integer([:positive])}")
+    previous = System.get_env("SYMPHONY_TEST_TOKEN")
+    System.put_env("SYMPHONY_TEST_TOKEN", "secret-hook-value\nsecond-secret-value")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: root,
+        hook_after_create: "i=0; while [ $i -lt 3000 ]; do printf a; i=$((i+1)); done; printf '\\n%s\\nfinal error\\n' \"$SYMPHONY_TEST_TOKEN\"; exit 17"
+      )
+
+      assert {:error, {:workspace_hook_failed, "after_create", 17, output}} = Workspace.create_for_issue("MT-EVIDENCE")
+      refute output =~ "secret-hook-value"
+      refute output =~ "second-secret-value"
+      assert output =~ "final error"
+      assert [transcript] = Path.wildcard(Path.join(root, ".symphony-hook-logs/*.log"))
+      assert File.read!(transcript) == String.duplicate("a", 3000) <> "\n[REDACTED]\nfinal error\n"
+      assert Bitwise.band(File.stat!(transcript).mode, 0o777) == 0o600
+      assert File.dir?(Path.join(root, "MT-EVIDENCE"))
+      assert Path.wildcard(Path.join(root, ".symphony-hook-logs/*.raw")) == []
+    after
+      restore_env("SYMPHONY_TEST_TOKEN", previous)
+      File.rm_rf(root)
+    end
+  end
+
+  test "failed hook diagnostics redact bare literal tracker credentials" do
+    root = Path.join(System.tmp_dir!(), "symphony-hook-config-secret-#{System.unique_integer([:positive])}")
+
+    try do
+      File.write!(Workflow.workflow_file_path(), """
+      ---
+      tracker:
+        kind: github
+        api_key: literal-api-secret
+        active_states: [open]
+        terminal_states: [closed]
+        provider:
+          repo: octo/repo
+          token: literal-github-secret
+      workspace:
+        root: #{root}
+      hooks:
+        after_create: "printf '%s\\n' literal-github-secret literal-api-secret; exit 17"
+      ---
+      Test configured credential redaction.
+      """)
+
+      :ok = SymphonyElixir.WorkflowStore.force_reload()
+      assert Config.settings!().tracker.provider["token"] == "literal-github-secret"
+      assert Config.settings!().tracker.api_key == "literal-api-secret"
+
+      assert {:error, {:workspace_hook_failed, "after_create", 17, output}} =
+               Workspace.create_for_issue("GH-1363")
+
+      assert output == "[REDACTED]\n[REDACTED]\n"
+      assert [transcript] = Path.wildcard(Path.join(root, ".symphony-hook-logs/*.log"))
+      assert File.read!(transcript) == output
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  test "interrupted hook diagnostics retain the partial final line" do
+    root = Path.join(System.tmp_dir!(), "symphony-hook-timeout-evidence-#{System.unique_integer([:positive])}")
+
+    try do
+      command = "printf 'last diagnostic'; sleep 2"
+      options = [workspace_root: root, hook_timeout_ms: 200, hook_after_create: command]
+      write_workflow_file!(Workflow.workflow_file_path(), options)
+      assert {:error, {:workspace_hook_timeout, "after_create", 200}} = Workspace.create_for_issue("MT-TIMEOUT-EVIDENCE")
+      assert [transcript] = Path.wildcard(Path.join(root, ".symphony-hook-logs/*.log"))
+      assert File.read!(transcript) == "last diagnostic"
+      assert File.exists?(Path.join(root, ".symphony-provisioning/MT-TIMEOUT-EVIDENCE"))
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  test "provisioning refuses a marker symlink without modifying its target" do
+    root = Path.join(System.tmp_dir!(), "symphony-marker-safety-#{System.unique_integer([:positive])}")
+
+    try do
+      File.mkdir_p!(Path.join(root, ".symphony-provisioning"))
+      protected = Path.join(root, "protected")
+      File.write!(protected, "retained")
+      File.ln_s!(protected, Path.join(root, ".symphony-provisioning/MT-MARKER"))
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, hook_after_create: "touch READY")
+      assert {:error, _} = Workspace.create_for_issue("MT-MARKER")
+      assert File.read!(protected) == "retained"
+      refute File.exists?(Path.join(root, "MT-MARKER"))
+    after
+      File.rm_rf(root)
     end
   end
 
@@ -1905,6 +2006,39 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                | "writableRoots" => [workspace, metadata_root, git_dir]
              }
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "remote tilde-root provisioning preserves failure and clears the same marker on retry" do
+    test_root = Path.join(System.user_home!(), ".symphony-remote-retry-#{System.unique_integer([:positive])}")
+    previous_path = System.get_env("PATH")
+
+    try do
+      File.mkdir_p!(test_root)
+      fake_ssh = Path.join(test_root, "ssh")
+      File.write!(fake_ssh, "#!/bin/sh\nfor argument do remote_command=\"$argument\"; done\nexec /bin/sh -c \"$remote_command\"\n")
+      File.chmod!(fake_ssh, 0o755)
+      System.put_env("PATH", test_root <> ":" <> previous_path)
+      root = "~/#{Path.basename(test_root)}/workspaces"
+      workspace = Path.join(test_root, "workspaces/MT-REMOTE-RETRY")
+      marker = Path.join(test_root, "workspaces/.symphony-provisioning/MT-REMOTE-RETRY")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: root,
+        worker_ssh_hosts: ["fake-worker"],
+        hook_after_create: "if [ ! -f partial ]; then printf retained > partial; exit 17; fi; printf ready > READY"
+      )
+
+      assert {:error, {:workspace_hook_failed, "after_create", 17, _}} = Workspace.create_for_issue("MT-REMOTE-RETRY", "fake-worker")
+      assert File.exists?(marker)
+      assert File.read!(Path.join(workspace, "partial")) == "retained"
+      assert {:ok, ^workspace} = Workspace.create_for_issue("MT-REMOTE-RETRY", "fake-worker")
+      refute File.exists?(marker)
+      assert File.read!(Path.join(workspace, "READY")) == "ready"
+      assert {:ok, ^workspace} = Workspace.create_for_issue("MT-REMOTE-RETRY", "fake-worker")
+    after
+      restore_env("PATH", previous_path)
       File.rm_rf(test_root)
     end
   end
