@@ -1,5 +1,10 @@
 # Symphony
 
+The Elixir implementation supports operator-prepared Codex conversation resume
+and acknowledged steering through its owned app-server connection. See the
+[Elixir restart and steering contract](elixir/README.md) for protected history
+manifests, one-shot resume and exact live-turn preconditions.
+
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 

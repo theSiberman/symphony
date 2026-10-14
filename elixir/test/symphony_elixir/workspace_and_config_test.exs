@@ -404,10 +404,24 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     root = Path.join(System.tmp_dir!(), "symphony-hook-timeout-evidence-#{System.unique_integer([:positive])}")
 
     try do
-      command = "printf 'last diagnostic'; sleep 2"
-      options = [workspace_root: root, hook_timeout_ms: 200, hook_after_create: command]
+      command = "printf 'last diagnostic'; touch printed; sleep 2"
+      options = [workspace_root: root, hook_timeout_ms: 1_000, hook_after_create: command]
       write_workflow_file!(Workflow.workflow_file_path(), options)
-      assert {:error, {:workspace_hook_timeout, "after_create", 200}} = Workspace.create_for_issue("MT-TIMEOUT-EVIDENCE")
+      task = Task.async(fn -> Workspace.create_for_issue("MT-TIMEOUT-EVIDENCE") end)
+      printed = Path.join(root, "MT-TIMEOUT-EVIDENCE/printed")
+
+      assert Enum.reduce_while(1..75, false, fn _, _ ->
+               if File.exists?(printed),
+                 do: {:halt, true},
+                 else:
+                   (
+                     Process.sleep(10)
+                     {:cont, false}
+                   )
+             end),
+             "hook must produce the partial line before the controlled timeout"
+
+      assert {:error, {:workspace_hook_timeout, "after_create", 1_000}} = Task.await(task, 2_000)
       assert [transcript] = Path.wildcard(Path.join(root, ".symphony-hook-logs/*.log"))
       assert File.read!(transcript) == "last diagnostic"
       assert File.exists?(Path.join(root, ".symphony-provisioning/MT-TIMEOUT-EVIDENCE"))

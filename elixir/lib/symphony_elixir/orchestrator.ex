@@ -61,7 +61,8 @@ defmodule SymphonyElixir.Orchestrator do
       blocked: %{},
       retry_attempts: %{},
       codex_totals: nil,
-      agent_rate_limits: nil
+      agent_rate_limits: nil,
+      steers: %{}
     ]
 
     @type t :: %__MODULE__{}
@@ -117,6 +118,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_info({:agent_steer_result, ref, result}, state) do
+    {:noreply, finish_steer(state, ref, result)}
+  end
+
+  def handle_info({:steer_timeout, ref}, state) do
+    {:noreply, finish_steer(state, ref, {:error, :delivery_unknown})}
+  end
+
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
       when is_reference(tick_token) do
     state = refresh_runtime_config(state)
@@ -236,6 +245,9 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
+
+        state = cancel_worker_steers(state, running_entry.pid)
+
         state = %{state | admission: :unchecked}
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
@@ -1672,6 +1684,7 @@ defmodule SymphonyElixir.Orchestrator do
         running =
           Map.put(state.running, issue.id, %{
             pid: pid,
+            steering_supported: Map.get(AgentRuntime.capabilities(), :steering, false),
             ref: ref,
             identifier: issue.identifier,
             issue: issue,
@@ -2020,6 +2033,32 @@ defmodule SymphonyElixir.Orchestrator do
     request_refresh(__MODULE__)
   end
 
+  @spec steer(GenServer.server(), String.t(), map()) :: {:ok, map()} | {:error, atom()}
+  def steer(server, identifier, request) do
+    GenServer.call(server, {:steer, identifier, request}, 7_000)
+  catch
+    :exit, {:timeout, _} -> {:error, :delivery_unknown}
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  defp cancel_worker_steers(state, pid) do
+    Enum.reduce(state.steers, state, fn {_id, entry}, acc ->
+      if entry.pid == pid and entry.result == nil, do: finish_steer(acc, entry.ref, {:error, :delivery_unknown}), else: acc
+    end)
+  end
+
+  defp finish_steer(state, ref, result) do
+    case Enum.find(state.steers, fn {_id, entry} -> entry.ref == ref and entry.result == nil end) do
+      nil ->
+        state
+
+      {id, entry} ->
+        Process.cancel_timer(entry.timer)
+        GenServer.reply(entry.from, result)
+        %{state | steers: Map.put(state.steers, id, %{entry | result: result, from: nil})}
+    end
+  end
+
   @spec request_refresh(GenServer.server()) :: map() | :unavailable
   def request_refresh(server) do
     if Process.whereis(server) do
@@ -2057,6 +2096,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_call({:steer, identifier, request}, from, state) do
+    if AgentRuntime.valid_steer_request?(request) do
+      case state.steers[request["request_id"]] do
+        entry when is_map(entry) ->
+          {:reply, repeated_steer(entry, identifier, request), state}
+
+        nil ->
+          start_steer(state, identifier, request, from)
+      end
+    else
+      {:reply, {:error, :invalid_request}, state}
+    end
+  end
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
@@ -2078,6 +2131,9 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
+          thread_id: Map.get(metadata, :thread_id),
+          turn_id: Map.get(metadata, :turn_id),
+          steering_supported: Map.get(metadata, :steering_supported, false),
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
@@ -2157,6 +2213,45 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
+  defp repeated_steer(entry, identifier, request) do
+    cond do
+      entry.request != request or entry.identifier != identifier -> {:error, :request_id_conflict}
+      entry.result == nil -> {:error, :steer_in_progress}
+      true -> entry.result
+    end
+  end
+
+  defp live_worker?(nil), do: false
+  defp live_worker?(entry), do: Process.alive?(entry.pid)
+
+  defp start_steer(state, identifier, request, from) do
+    running = Enum.find_value(state.running, fn {_id, entry} -> if entry.identifier == identifier, do: entry end)
+
+    cond do
+      not live_worker?(running) ->
+        {:reply, {:error, :not_running}, state}
+
+      not Map.get(running, :steering_supported, false) ->
+        {:reply, {:error, :unsupported}, state}
+
+      running.session_id != request["expected_session_id"] ->
+        {:reply, {:error, :stale_session}, state}
+
+      map_size(state.steers) >= 1_024 ->
+        {:reply, {:error, :steer_capacity}, state}
+
+      Enum.any?(state.steers, fn {_id, entry} -> entry.pid == running.pid and entry.result == nil end) ->
+        {:reply, {:error, :steer_in_progress}, state}
+
+      true ->
+        ref = make_ref()
+        timer = Process.send_after(self(), {:steer_timeout, ref}, 6_000)
+        entry = %{ref: ref, timer: timer, pid: running.pid, from: from, request: request, identifier: identifier, result: nil}
+        send(running.pid, {:agent_steer, self(), ref, request})
+        {:noreply, %{state | steers: Map.put(state.steers, request["request_id"], entry)}}
+    end
+  end
+
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil
 
@@ -2179,6 +2274,8 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
+        thread_id: session_identity_for_update(running_entry, update, :thread_id),
+        turn_id: session_identity_for_update(running_entry, update, :turn_id),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
@@ -2210,6 +2307,9 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  defp session_identity_for_update(_entry, %{event: :session_started} = update, key), do: Map.get(update, key)
+  defp session_identity_for_update(entry, _update, key), do: Map.get(entry, key)
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,

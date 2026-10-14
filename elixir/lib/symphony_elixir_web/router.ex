@@ -37,6 +37,8 @@ defmodule SymphonyElixirWeb.Router do
 
   scope "/", SymphonyElixirWeb do
     get("/api/v1/state", ObservabilityApiController, :state)
+    post("/api/v1/:issue_identifier/steer", ObservabilityApiController, :steer)
+    match(:*, "/api/v1/:issue_identifier/steer", ObservabilityApiController, :method_not_allowed)
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)
     match(:*, "/api/v1/state", ObservabilityApiController, :method_not_allowed)

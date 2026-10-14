@@ -88,7 +88,9 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    with {:ok, session} <- AgentRuntime.start_session(workspace, worker_host: worker_host) do
+    session_opts = [worker_host: worker_host, issue_identifier: issue.identifier]
+
+    with {:ok, session} <- AgentRuntime.start_session(workspace, session_opts) do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after

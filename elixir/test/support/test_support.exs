@@ -216,6 +216,7 @@ defmodule SymphonyElixir.TestSupport do
         "  redispatch_on_transition_to: #{yaml_value(redispatch_on_transition_to)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
+        "  resume_manifest_path: #{yaml_value(Keyword.get(config, :codex_resume_manifest_path))}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
         "  thread_sandbox: #{yaml_value(codex_thread_sandbox)}",
         "  turn_sandbox_policy: #{yaml_value(codex_turn_sandbox_policy)}",

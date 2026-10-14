@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Codex.ResumeManifest, Config, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -26,6 +26,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
+    opts = Keyword.put_new(opts, :issue_identifier, Map.get(issue, :identifier))
+
     with {:ok, session} <- start_session(workspace, opts) do
       try do
         run_turn(session, prompt, issue, opts)
@@ -41,12 +43,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     dynamic_tool_binding = DynamicTool.bind()
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+         {:ok, resume} <- resume_entry(expanded_workspace, worker_host, opts),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
+             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding, resume) do
+        record_resume_handoff(port, resume)
+
         {:ok,
          %{
            port: port,
@@ -84,6 +89,12 @@ defmodule SymphonyElixir.Codex.AppServer do
         issue,
         opts \\ []
       ) do
+    prompt =
+      case Process.delete({__MODULE__, :handoff, port}) do
+        nil -> prompt
+        handoff -> handoff <> "\n\n" <> prompt
+      end
+
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
 
     tool_executor =
@@ -107,7 +118,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, thread_id, turn_id) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -144,6 +155,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec stop_session(session()) :: :ok
   def stop_session(%{port: port}) when is_port(port) do
+    Process.delete({__MODULE__, :handoff, port})
     stop_port(port)
   end
 
@@ -304,12 +316,60 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
+  defp record_resume_handoff(_port, nil), do: :ok
+  defp record_resume_handoff(port, resume), do: Process.put({__MODULE__, :handoff, port}, resume["handoff_text"])
+
+  defp resume_entry(workspace, nil, opts) do
+    ResumeManifest.load(workspace, Keyword.get(opts, :issue_identifier), Config.settings!().codex)
+  end
+
+  defp resume_entry(_workspace, _host, _opts) do
+    if Config.settings!().codex.resume_manifest_path, do: {:error, :remote_resume_unsupported}, else: {:ok, nil}
+  end
+
+  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding, resume) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
+      :ok when is_nil(resume) -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
+      :ok -> resume_thread(port, workspace, session_policies, resume)
       {:error, reason} -> {:error, reason}
     end
   end
+
+  defp resume_thread(port, workspace, policies, entry) do
+    send_message(port, %{
+      "id" => @thread_start_id,
+      "method" => "thread/resume",
+      "params" => %{
+        "threadId" => entry["thread_id"],
+        "excludeTurns" => true,
+        "cwd" => workspace,
+        "approvalPolicy" => policies.approval_policy,
+        "sandbox" => policies.thread_sandbox
+      }
+    })
+
+    case await_response(port, @thread_start_id) do
+      {:ok, response} -> validate_resumed_thread(response, entry, workspace)
+      error -> error
+    end
+  end
+
+  defp validate_resumed_thread(response, entry, workspace) when is_map(response) do
+    expected_id = entry["thread_id"]
+    expected = %{"model" => entry["profile"]["model"], "modelProvider" => entry["profile"]["model_provider"], "reasoningEffort" => entry["profile"]["reasoning_effort"], "cwd" => workspace}
+    profile = Map.take(response, Map.keys(expected))
+
+    if profile == expected and match?(%{"id" => ^expected_id, "cwd" => ^workspace}, response["thread"]) do
+      case ResumeManifest.consume(entry) do
+        :ok -> {:ok, expected_id}
+        error -> error
+      end
+    else
+      {:error, :resumed_thread_mismatch}
+    end
+  end
+
+  defp validate_resumed_thread(_, _, _), do: {:error, :resumed_thread_mismatch}
 
   defp start_thread(
          port,
@@ -365,24 +425,40 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
-    receive_loop(
-      port,
-      on_message,
-      Config.settings!().codex.turn_timeout_ms,
-      "",
-      tool_executor,
-      auto_approve_requests
-    )
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, thread_id, turn_id) do
+    timeout = Config.settings!().codex.turn_timeout_ms
+    # The port owner remains the sole protocol reader/writer. Process-local
+    # control context spans the existing recursive stream handlers and is always
+    # removed before this owner starts another turn.
+    Process.put({__MODULE__, :control}, %{thread_id: thread_id, turn_id: turn_id, session_id: "#{thread_id}-#{turn_id}", deadline: now_ms() + timeout, pending: nil})
+
+    try do
+      receive_loop(
+        port,
+        on_message,
+        timeout,
+        "",
+        tool_executor,
+        auto_approve_requests
+      )
+    after
+      finish_pending_steer({:error, :delivery_unknown})
+      Process.delete({__MODULE__, :control})
+    end
   end
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+    expire_pending_steer()
+
     receive do
       {^port, {:data, {:eol, chunk}}} ->
+        touch_turn_deadline(timeout_ms)
         complete_line = pending_line <> to_string(chunk)
         handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
 
       {^port, {:data, {:noeol, chunk}}} ->
+        touch_turn_deadline(timeout_ms)
+
         receive_loop(
           port,
           on_message,
@@ -394,9 +470,23 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
+
+      {:agent_steer, recipient, ref, request} when is_pid(recipient) and is_reference(ref) ->
+        if now_ms() >= control().deadline do
+          send(recipient, {:agent_steer_result, ref, {:error, :stale_session}})
+          {:error, :turn_timeout}
+        else
+          send_steer(port, recipient, ref, request)
+          receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests)
+        end
     after
-      timeout_ms ->
-        {:error, :turn_timeout}
+      receive_timeout() ->
+        if now_ms() >= control().deadline do
+          {:error, :turn_timeout}
+        else
+          finish_pending_steer({:error, :delivery_unknown})
+          receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests)
+        end
     end
   end
 
@@ -446,6 +536,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
 
       {:ok, payload} ->
+        acknowledge_steer(payload)
+
         emit_message(
           on_message,
           :other_message,
@@ -474,6 +566,102 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
 
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp control, do: Process.get({__MODULE__, :control})
+  defp now_ms, do: System.monotonic_time(:millisecond)
+  defp touch_turn_deadline(timeout), do: Process.put({__MODULE__, :control}, %{control() | deadline: now_ms() + timeout})
+
+  defp receive_timeout do
+    state = control()
+    deadline = if state.pending, do: min(state.deadline, state.pending.deadline), else: state.deadline
+    max(deadline - now_ms(), 0)
+  end
+
+  defp send_steer(port, recipient, ref, request) do
+    state = control()
+
+    cond do
+      not SymphonyElixir.AgentRuntime.valid_steer_request?(request) ->
+        send(recipient, {:agent_steer_result, ref, {:error, :invalid_request}})
+
+      request["expected_session_id"] != state.session_id or request["expected_thread_id"] != state.thread_id or request["expected_turn_id"] != state.turn_id ->
+        send(recipient, {:agent_steer_result, ref, {:error, :stale_session}})
+
+      state.pending != nil ->
+        send(recipient, {:agent_steer_result, ref, {:error, :steer_in_progress}})
+
+      true ->
+        id = "steer:" <> request["request_id"]
+        pending = %{id: id, ref: ref, recipient: recipient, deadline: now_ms() + 5_000}
+        Process.put({__MODULE__, :control}, %{state | pending: pending})
+
+        send_message(port, %{
+          "id" => id,
+          "method" => "turn/steer",
+          "params" => %{
+            "threadId" => state.thread_id,
+            "expectedTurnId" => state.turn_id,
+            "clientUserMessageId" => request["request_id"],
+            "input" => [%{"type" => "text", "text" => request["text"]}]
+          }
+        })
+    end
+  end
+
+  defp acknowledge_steer(payload) when is_map(payload) do
+    expire_pending_steer()
+    state = control()
+
+    case state.pending do
+      %{id: id} ->
+        if id == payload["id"] do
+          result = steer_response(payload, state)
+
+          finish_pending_steer(result)
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp acknowledge_steer(_), do: :ok
+
+  defp steer_response(payload, state) do
+    case payload do
+      %{"result" => %{"turnId" => turn}} when turn == state.turn_id ->
+        {:ok, %{accepted_turn_id: turn, session_id: state.session_id}}
+
+      %{"error" => _} ->
+        {:error, :provider_rejected}
+
+      _ ->
+        {:error, :delivery_unknown}
+    end
+  end
+
+  defp expire_pending_steer do
+    now = now_ms()
+
+    case control() do
+      %{pending: %{deadline: deadline}} when deadline <= now ->
+        finish_pending_steer({:error, :delivery_unknown})
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp finish_pending_steer(result) do
+    case control() do
+      %{pending: %{recipient: recipient, ref: ref}} = state ->
+        send(recipient, {:agent_steer_result, ref, result})
+        Process.put({__MODULE__, :control}, %{state | pending: nil})
+
+      _ ->
+        :ok
     end
   end
 
