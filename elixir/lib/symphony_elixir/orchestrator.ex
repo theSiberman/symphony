@@ -607,18 +607,40 @@ defmodule SymphonyElixir.Orchestrator do
 
     case result do
       {:ok, %Issue{} = issue} ->
-        if Map.get(state.retry_attempts, issue.id) == context.retry and
-             validate_label_ownership(state) == :ok and
-             should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set()) and
-             (Config.settings!().agent.admission_command == nil or
-                state.admission_context == admission_context(state, issue)) do
-          do_dispatch_issue(state, issue, context.attempt, context.worker_host)
-        else
-          state
+        case dispatch_rejection(state, context, issue) do
+          nil ->
+            do_dispatch_issue(state, issue, context.attempt, context.worker_host)
+
+          reason ->
+            Logger.info("Dropping refreshed dispatch for #{issue_context(issue)}: #{reason}")
+            state
         end
 
       _ ->
         state
+    end
+  end
+
+  defp dispatch_rejection(state, context, issue) do
+    cond do
+      Map.get(state.retry_attempts, issue.id) != context.retry ->
+        "retry entry changed during refresh"
+
+      validate_label_ownership(state) != :ok ->
+        "running label ownership changed"
+
+      not admission_available?(state) ->
+        "admission not available (#{inspect(state.admission)})"
+
+      not eligible_issue?(issue, state, active_state_set(), terminal_state_set(), System.monotonic_time(:millisecond)) ->
+        "issue not eligible"
+
+      Config.settings!().agent.admission_command != nil and
+          state.admission_context != admission_context(state, issue) ->
+        "admission context changed: admitted=#{inspect(state.admission_context)} current=#{inspect(admission_context(state, issue))}"
+
+      true ->
+        nil
     end
   end
 
