@@ -32,12 +32,14 @@ defmodule SymphonyElixir.Tracker do
 
   @callback bind_running_labels(map()) :: map() | nil
   @callback reconcile_running_labels(map(), [String.t()]) :: :ok | {:error, term()}
+  @callback running_label_guard(map()) :: nil | {:ok, String.t(), MapSet.t(String.t())} | {:error, term()}
 
   @optional_callbacks pause_issue: 2,
                       pause_issue: 3,
                       pause_issue: 4,
                       bind_running_labels: 1,
                       reconcile_running_labels: 2,
+                      running_label_guard: 1,
                       agent_tool_specs: 0,
                       execute_agent_tool: 3,
                       validate_config: 1
@@ -114,8 +116,21 @@ defmodule SymphonyElixir.Tracker do
     adapter.reconcile_running_labels(settings, ids)
   end
 
+  @doc """
+  Dispatch guard for a shared (ledger-owned) running label: `nil` when the
+  label is absent or exclusively owned, `{:ok, label, owned_ids}` when issues
+  carrying the label outside `owned_ids` are foreign claims, or an error when
+  ownership cannot be determined (callers fail closed).
+  """
+  @spec running_label_guard(map() | nil) :: nil | {:ok, String.t(), MapSet.t(String.t())} | {:error, term()}
+  def running_label_guard(nil), do: nil
+
+  def running_label_guard(%{adapter: adapter, tracker_settings: settings}) do
+    if function_exported?(adapter, :running_label_guard, 1), do: adapter.running_label_guard(settings)
+  end
+
   defp label_identity(nil), do: nil
-  defp label_identity(binding), do: {binding.adapter, binding.scope}
+  defp label_identity(binding), do: {binding.adapter, binding.scope, Map.get(binding, :ownership)}
 
   @doc """
   Captures the selected adapter and effective tracker settings for one

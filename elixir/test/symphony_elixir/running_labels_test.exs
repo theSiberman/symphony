@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.RunningLabelsTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.GitHub.RunningLabels
+  alias SymphonyElixir.GitHub.{RunningLabelLedger, RunningLabels}
 
   defmodule GitHub do
     def request(method, path, params, body, opts) do
@@ -206,6 +206,155 @@ defmodule SymphonyElixir.RunningLabelsTest do
     assert :sys.get_state(LabelOrchestrator).running |> Map.keys() == ["321"]
   end
 
+  describe "ledger ownership (shared label)" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "symphony-ledger-#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(dir) end)
+      %{path: Path.join(dir, "running-labels.json")}
+    end
+
+    test "exclusive ownership (explicit or default) still removes every unowned marker", %{path: path} do
+      update(%{labels: MapSet.new([10, 1])})
+      exclusive = put_in(settings(), [:provider, "managed_running_label_ownership"], "exclusive")
+      exclusive = put_in(exclusive, [:provider, "managed_running_label_ledger_path"], path)
+      assert :ok = RunningLabels.validate_config(exclusive)
+      assert nil == RunningLabels.guard(exclusive)
+      assert :ok = RunningLabels.reconcile(exclusive, ["2"], &GitHub.request/5)
+      assert labels() == MapSet.new([2])
+      refute File.exists?(path)
+    end
+
+    test "never removes foreign labels; removes and forgets own stopped labels; drops stale entries", %{path: path} do
+      settings = ledger_settings(path)
+      :ok = RunningLabelLedger.write(path, scope(), ["1", "2", "4"])
+      update(%{labels: MapSet.new([10, 1, 2])})
+
+      assert :ok = RunningLabels.reconcile(settings, ["2", "3"], &GitHub.request/5)
+      assert labels() == MapSet.new([10, 2, 3])
+      assert {:ok, ledger} = RunningLabelLedger.read(path, scope())
+      assert ledger == MapSet.new(["2", "3"])
+      refute Enum.any?(calls(), fn {method, path, _, _} -> method == "DELETE" and String.contains?(path, "/10/") end)
+
+      assert :ok = RunningLabels.reconcile(settings, [], &GitHub.request/5)
+      assert labels() == MapSet.new([10])
+      assert {:ok, ledger} = RunningLabelLedger.read(path, scope())
+      assert ledger == MapSet.new()
+    end
+
+    test "own label already gone at DELETE time (404) is forgotten", %{path: path} do
+      :ok = RunningLabelLedger.write(path, scope(), ["1"])
+      update(%{labels: MapSet.new([1])})
+
+      request = fn
+        "DELETE", _path, _params, _body, _opts -> {:ok, %{status: 404, body: %{}}}
+        method, path, params, body, opts -> GitHub.request(method, path, params, body, opts)
+      end
+
+      assert :ok = RunningLabels.reconcile(ledger_settings(path), [], request)
+      assert {:ok, ledger} = RunningLabelLedger.read(path, scope())
+      assert ledger == MapSet.new()
+    end
+
+    test "records additions before POST so failed or crashed additions are retried or cleaned up", %{path: path} do
+      settings = ledger_settings(path)
+      test_pid = self()
+
+      failing = fn
+        "POST", _path, _params, _body, _opts ->
+          send(test_pid, {:ledger_at_post, RunningLabelLedger.read(path, scope())})
+          {:ok, %{status: 502, body: %{}}}
+
+        method, path, params, body, opts ->
+          GitHub.request(method, path, params, body, opts)
+      end
+
+      assert {:error, {:running_label_http_status, 502}} = RunningLabels.reconcile(settings, ["3"], failing)
+      assert_received {:ledger_at_post, {:ok, at_post}}
+      assert MapSet.member?(at_post, "3")
+      assert labels() == MapSet.new()
+      assert {:ok, ledger} = RunningLabelLedger.read(path, scope())
+      assert MapSet.member?(ledger, "3")
+
+      assert :ok = RunningLabels.reconcile(settings, ["3"], &GitHub.request/5)
+      assert labels() == MapSet.new([3])
+
+      # A recorded addition whose POST never landed is forgotten once it stops running.
+      :ok = RunningLabelLedger.write(path, scope(), ["3", "5"])
+      assert :ok = RunningLabels.reconcile(settings, ["3"], &GitHub.request/5)
+      assert {:ok, ledger} = RunningLabelLedger.read(path, scope())
+      assert ledger == MapSet.new(["3"])
+    end
+
+    test "scope mismatch or corrupt ledger fails closed without requests", %{path: path} do
+      update(%{labels: MapSet.new([1])})
+      settings = ledger_settings(path)
+
+      :ok = RunningLabelLedger.write(path, {"https://api.github.com", "other/repo", "in-progress"}, ["1"])
+      assert {:error, :running_label_ledger_scope_mismatch} = RunningLabels.reconcile(settings, [], &GitHub.request/5)
+      assert {:error, :running_label_ledger_scope_mismatch} = RunningLabels.guard(settings)
+
+      File.write!(path, "{not json")
+      assert {:error, :running_label_ledger_corrupt} = RunningLabels.reconcile(settings, ["2"], &GitHub.request/5)
+      assert {:error, :running_label_ledger_corrupt} = RunningLabels.guard(settings)
+
+      assert calls() == []
+      assert labels() == MapSet.new([1])
+    end
+
+    test "validates ownership and ledger path", %{path: path} do
+      assert :ok = RunningLabels.validate_config(ledger_settings(path))
+
+      for {ownership, ledger_path, error} <- [
+            {"shared", path, :invalid_github_managed_running_label_ownership},
+            {"ledger", nil, :invalid_github_managed_running_label_ledger_path},
+            {"ledger", "relative/ledger.json", :invalid_github_managed_running_label_ledger_path}
+          ] do
+        invalid = put_in(ledger_settings(ledger_path), [:provider, "managed_running_label_ownership"], ownership)
+        assert {:error, ^error} = RunningLabels.validate_config(invalid)
+      end
+
+      no_label = update_in(ledger_settings(path), [:provider], &Map.delete(&1, "managed_running_label"))
+      assert {:error, :invalid_github_managed_running_label_ownership} = RunningLabels.validate_config(no_label)
+
+      binding = Tracker.bind_running_labels(ledger_settings(path))
+      assert binding.ownership == {:ledger, path}
+      refute Tracker.running_labels_compatible?(binding, settings())
+    end
+
+    test "foreign-labelled candidates are not dispatched; own-ledger labelled candidates are", %{path: path} do
+      write_github_workflow("octo/repo", "    managed_running_label_ownership: ledger\n    managed_running_label_ledger_path: #{path}\n")
+      :ok = RunningLabelLedger.write(path, scope(), ["42"])
+      binding = Tracker.bind_running_labels(Config.settings!().tracker)
+
+      state = %Orchestrator.State{
+        max_concurrent_agents: 3,
+        running_labels: binding,
+        label_guard: Tracker.running_label_guard(binding),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      }
+
+      issue = fn id, labels ->
+        %Issue{id: id, identifier: "GH-#{id}", title: "T", state: "ready", dispatchable: true, labels: labels}
+      end
+
+      refute Orchestrator.should_dispatch_issue_for_test(issue.("1354", ["ready", "In-Progress"]), state)
+      assert Orchestrator.should_dispatch_issue_for_test(issue.("42", ["ready", "in-progress"]), state)
+      assert Orchestrator.should_dispatch_issue_for_test(issue.("7", ["ready"]), state)
+
+      File.write!(path, "corrupt")
+      closed = %{state | label_guard: Tracker.running_label_guard(binding)}
+      refute Orchestrator.should_dispatch_issue_for_test(issue.("7", ["ready"]), closed)
+    end
+  end
+
+  defp ledger_settings(path) do
+    settings()
+    |> put_in([:provider, "managed_running_label_ownership"], "ledger")
+    |> put_in([:provider, "managed_running_label_ledger_path"], path)
+  end
+
+  defp scope, do: {"https://api.github.com", "octo/repo", "in-progress"}
+
   defp start_runtime do
     opts = [name: LabelRuntime, task_supervisor_name: LabelTasks, orchestrator_name: LabelOrchestrator]
     start_supervised!({SymphonyElixir.AgentRuntimeSupervisor, opts})
@@ -245,7 +394,7 @@ defmodule SymphonyElixir.RunningLabelsTest do
     worker
   end
 
-  defp write_github_workflow(repo \\ "octo/repo") do
+  defp write_github_workflow(repo \\ "octo/repo", extra_provider \\ "") do
     File.write!(Workflow.workflow_file_path(), """
     ---
     tracker:
@@ -255,7 +404,7 @@ defmodule SymphonyElixir.RunningLabelsTest do
         token: test-token
         state_source: labels
         managed_running_label: in-progress
-      required_labels: [ready]
+    #{extra_provider}  required_labels: [ready]
       active_states: [ready]
       terminal_states: [closed]
     polling:

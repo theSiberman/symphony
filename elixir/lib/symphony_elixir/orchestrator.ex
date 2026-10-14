@@ -54,6 +54,7 @@ defmodule SymphonyElixir.Orchestrator do
       poll_requested: false,
       label_task: nil,
       label_issue_ids: [],
+      label_guard: nil,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -602,6 +603,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp apply_tracker_result(state, %{kind: :dispatch} = context, result) do
+    state = refresh_label_guard(state)
+
     case result do
       {:ok, %Issue{} = issue} ->
         if Map.get(state.retry_attempts, issue.id) == context.retry and
@@ -763,8 +766,32 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | foreign_claims: Map.filter(state.foreign_claims, fn {_id, expires_at_ms} -> expires_at_ms > now_ms end)}
   end
 
-  defp claimed_here_or_elsewhere?(state, issue_id, now_ms) do
-    MapSet.member?(state.claimed, issue_id) or foreign_claimed?(state, issue_id, now_ms)
+  # Shared running label (ledger ownership): an issue carrying the label that
+  # this scheduler did not record is claimed by someone else (e.g. a human).
+  # An untrustworthy ledger blocks all new dispatch. Running workers are never
+  # re-checked here, so they are not stopped by this rule.
+  defp refresh_label_guard(state) do
+    guard = Tracker.running_label_guard(state.running_labels)
+
+    if match?({:error, _}, guard) and guard != state.label_guard,
+      do: Logger.error("Running-label ledger unavailable; blocking new dispatch: #{inspect(guard)}")
+
+    %{state | label_guard: guard}
+  end
+
+  defp foreign_label_claim?(%{label_guard: nil}, _issue), do: false
+
+  defp foreign_label_claim?(%{label_guard: {:ok, label, owned}}, %Issue{id: id, labels: labels}) when is_list(labels) do
+    label = normalize_issue_state(label)
+    Enum.any?(labels, &(is_binary(&1) and normalize_issue_state(&1) == label)) and not MapSet.member?(owned, id)
+  end
+
+  defp foreign_label_claim?(%{label_guard: {:ok, _label, _owned}}, _issue), do: false
+  defp foreign_label_claim?(_state, _issue), do: true
+
+  defp claimed_here_or_elsewhere?(state, %Issue{id: issue_id} = issue, now_ms) do
+    MapSet.member?(state.claimed, issue_id) or foreign_claimed?(state, issue_id, now_ms) or
+      foreign_label_claim?(state, issue)
   end
 
   defp foreign_claimed?(state, issue_id, now_ms) do
@@ -1254,7 +1281,7 @@ defmodule SymphonyElixir.Orchestrator do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
     now_ms = System.monotonic_time(:millisecond)
-    state = prune_foreign_claims(state, now_ms)
+    state = state |> prune_foreign_claims(now_ms) |> refresh_label_guard()
 
     candidates =
       issues
@@ -1456,7 +1483,7 @@ defmodule SymphonyElixir.Orchestrator do
        )
        when is_integer(now_ms) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !claimed_here_or_elsewhere?(state, issue.id, now_ms) and
+      !claimed_here_or_elsewhere?(state, issue, now_ms) and
       retry_due?(state, issue.id, now_ms) and
       state.exception_error == nil and
       !Map.has_key?(running, issue.id) and

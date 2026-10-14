@@ -29,6 +29,9 @@ defmodule SymphonyElixir.GitHub.Adapter do
   @spec bind_running_labels(map()) :: map() | nil
   def bind_running_labels(settings), do: RunningLabels.bind(settings)
 
+  @spec running_label_guard(map()) :: nil | {:ok, String.t(), MapSet.t(String.t())} | {:error, term()}
+  def running_label_guard(settings), do: RunningLabels.guard(settings)
+
   @spec reconcile_running_labels(map(), [String.t()]) :: :ok | {:error, term()}
   def reconcile_running_labels(settings, ids) do
     client = client_module()

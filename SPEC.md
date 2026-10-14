@@ -2377,6 +2377,15 @@ Mutation scope is bound at startup. Changing repository, API endpoint, or manage
 requires a restart and prevents new admissions until then; writes retain the original scope.
 Before changing ownership scope, operators must reconcile the old scope while idle.
 
+GitHub additionally supports shared ownership (`tracker.provider.managed_running_label_ownership:
+ledger`, default `exclusive`, with an absolute `managed_running_label_ledger_path`). The
+scheduler then owns only issues it recorded in a durable ledger bound to `{api_url, repo, label}`:
+ids are recorded before the label is added, the label is removed only from recorded issues that
+are not running, and ids leave the ledger once their label is gone. Issues carrying the label
+outside the ledger are foreign claims that are never unlabelled and never dispatched; running
+workers are unaffected. A corrupt, unreadable or different-scope ledger fails closed (no label
+mutations, no new dispatch).
+
 
 ### Host admission and retry eligibility (Elixir extension)
 

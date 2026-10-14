@@ -347,6 +347,17 @@ codex:
   and admissions stop until restart. Keep the old ownership setting through a final idle
   reconciliation before changing it, so labels in the old scope are removed. Token environment
   references remain resolved at request time. Agents should leave this audit label to Symphony.
+- Shared running label (opt-in): set `tracker.provider.managed_running_label_ownership: ledger`
+  (default `exclusive`, the behaviour above) plus an absolute
+  `tracker.provider.managed_running_label_ledger_path` to share the label with other actors, such
+  as a human marking manually claimed issues. Symphony then records every issue id it labels in a
+  JSON ledger (written atomically, scoped to API endpoint, repository and label) before adding
+  the label, and only ever removes the label from ledger issues that are no longer running; ledger
+  entries are dropped once their label is removed or already absent. Labelled issues outside the
+  ledger are foreign claims: they are never unlabelled and are not dispatched (running workers are
+  not stopped). A missing ledger file is treated as empty; an unreadable, corrupt or
+  different-scope ledger fails closed: reconciliation makes no API calls and new dispatch stops
+  until the file is fixed. Changing ownership mode or ledger path requires a restart.
 - Frontier and scope: label-state polling follows all pages of GitHub's native `blocked_by`
   relationship. An issue with any open blocker remains visible but is non-dispatchable; it becomes
   eligible on the first poll after its final blocker closes. Dispatch is revalidated immediately
