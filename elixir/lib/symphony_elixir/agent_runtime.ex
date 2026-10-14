@@ -28,6 +28,7 @@ defmodule SymphonyElixir.AgentRuntime do
   assuming every runtime behaves like Codex.
   """
   @type capabilities :: %{
+          optional(:steering) => boolean(),
           structured_usage: boolean(),
           streams_progress: boolean(),
           rate_limit_reporting: boolean(),
@@ -83,6 +84,20 @@ defmodule SymphonyElixir.AgentRuntime do
 
   @spec capabilities() :: capabilities()
   def capabilities, do: adapter().capabilities()
+
+  @spec valid_steer_request?(term()) :: boolean()
+  def valid_steer_request?(request) when is_map(request) do
+    keys = ["request_id", "expected_session_id", "expected_thread_id", "expected_turn_id", "text"]
+
+    Map.keys(request) |> Enum.sort() == Enum.sort(keys) and
+      Enum.all?(keys, fn key ->
+        value = request[key]
+        limit = if key == "text", do: 8_192, else: 512
+        is_binary(value) and byte_size(value) in 1..limit and String.valid?(value) and String.trim(value) != "" and not String.contains?(value, <<0>>)
+      end)
+  end
+
+  def valid_steer_request?(_), do: false
 
   @doc """
   Whether silence between turn start and turn end means the worker is stuck.

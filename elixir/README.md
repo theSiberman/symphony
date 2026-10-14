@@ -510,3 +510,25 @@ For an owned per-workspace OpenCode service, set `opencode.workspace_runtime: tr
 The before-run hook must write `.scratch/opencode.json` containing version 1,
 workspace, loopback `base_url`, and password. The adapter fails closed if absent.
 The deployment must stop the service cgroup and confirm exit before deleting temp.
+
+To prepare a Codex conversation for an operator-controlled restart, set
+`codex.resume_manifest_path` to an absolute manifest outside the workspace root.
+The `symphony.codex-resume.v1` manifest must be `ready`, with entries binding an
+issue identifier, canonical workspace, thread ID, command SHA256 and original
+model/provider/reasoning effort. Each entry authenticates a complete JSONL
+snapshot and consistent `state_5.sqlite` / `thread_history_1.sqlite` backups under
+the manifest parent's `snapshots/` directory. The control directories require
+0700 and files 0600, owned by the scheduler user. Deployment restores this
+history into the new private CODEX_HOME before the app-server starts. Symphony
+uses native `thread/resume`, checks its returned identity/profile, and durably
+records one-shot consumption before starting a turn. Invalid or consumed entries
+stop startup; a subsequent restart needs new evidence or explicit entry removal
+for a fresh conversation. This does not upgrade already-running escript workers.
+
+`POST /api/v1/:issue_identifier/steer` accepts `request_id`, `expected_session_id`,
+`expected_thread_id`, `expected_turn_id` and a nonblank UTF-8 `text` of at most
+8192 bytes. Only the running Codex port owner sends native `turn/steer`; HTTP 200
+means its matching turn ID was acknowledged, not that guidance has been acted
+upon. Stale/unsupported/conflicting requests return 409; sent requests without
+an acknowledgement return 504 `delivery_unknown`. Duplicate request IDs within
+this scheduler lifetime do not resend input. Worker environment is unchanged.

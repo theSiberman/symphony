@@ -37,6 +37,29 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec steer(Conn.t(), map()) :: Conn.t()
+  def steer(conn, %{"issue_identifier" => identifier} = params) do
+    request = Map.delete(params, "issue_identifier")
+
+    case SymphonyElixir.Orchestrator.steer(orchestrator(), identifier, request) do
+      {:ok, result} ->
+        json(conn, Map.put(result, :request_id, request["request_id"]))
+
+      {:error, reason} ->
+        status =
+          case reason do
+            :invalid_request -> 400
+            :not_running -> 404
+            :unavailable -> 503
+            :delivery_unknown -> 504
+            :steer_capacity -> 429
+            _ -> 409
+          end
+
+        error_response(conn, status, Atom.to_string(reason), "Steering request #{reason}")
+    end
+  end
+
   @spec method_not_allowed(Conn.t(), map()) :: Conn.t()
   def method_not_allowed(conn, _params) do
     error_response(conn, 405, "method_not_allowed", "Method not allowed")

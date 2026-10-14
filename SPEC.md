@@ -1206,6 +1206,21 @@ Error mapping (RECOMMENDED normalized categories):
 
 ### 10.7 Agent Runner Contract
 
+Fork-owned operator restart and steering capabilities:
+
+- A configured `codex.resume_manifest_path` authenticates protected, complete
+  JSONL and paginated-history SQLite backups, workspace/thread/profile identity
+  and bounded operator handoff text. Only `ready` evidence may bootstrap native
+  `thread/resume`. After a matching response, durable one-shot consumption blocks
+  replay; failed validation never falls back to a new thread. Deployment restores
+  the evidence into the new private runtime before provider launch. The first
+  resumed turn receives the handoff instruction before ordinary ticket guidance.
+- A per-issue steer request must match the running session, thread and turn. The
+  existing app-server port owner sends native `turn/steer` and demultiplexes its
+  acknowledgement with notifications. HTTP success means matching acceptance;
+  missing acknowledgement is delivery-unknown. Duplicate requests do not resend,
+  and mailbox traffic cannot extend the original provider silence deadline.
+
 The `Agent Runner` wraps workspace + prompt + app-server client.
 
 Behavior:

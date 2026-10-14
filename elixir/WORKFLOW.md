@@ -42,6 +42,8 @@ agent:
 #   workspace_runtime: true # requires .scratch/opencode.json from before_run
 # Configure after_run and before_remove hooks to confirm service teardown.
 codex:
+  # Optional operator-protected, one-shot restart manifest (see README.md).
+  # resume_manifest_path: /absolute/operator/control/resume.json
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
   thread_sandbox: workspace-write
