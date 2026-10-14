@@ -165,6 +165,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:admission_command, :string)
+      # How long a candidate stays skipped after admission exits 76 (claimed by another scheduler).
+      field(:foreign_claim_ttl_ms, :integer, default: 600_000)
       field(:max_abnormal_retries, :integer, default: 3)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
@@ -181,6 +183,7 @@ defmodule SymphonyElixir.Config.Schema do
           :max_concurrent_agents,
           :max_turns,
           :admission_command,
+          :foreign_claim_ttl_ms,
           :max_abnormal_retries,
           :max_retry_backoff_ms,
           :max_concurrent_agents_by_state,
@@ -193,6 +196,8 @@ defmodule SymphonyElixir.Config.Schema do
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
+      |> validate_required([:foreign_claim_ttl_ms])
+      |> validate_number(:foreign_claim_ttl_ms, greater_than: 0)
       |> validate_number(:max_abnormal_retries, greater_than_or_equal_to: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)

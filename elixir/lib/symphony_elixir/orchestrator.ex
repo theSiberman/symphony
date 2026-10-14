@@ -12,6 +12,8 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Usage.Payload
 
   @continuation_retry_delay_ms 1_000
+  # Admission command exit status meaning "another scheduler owns this candidate".
+  @foreign_claim_exit_status 76
   @failure_retry_base_ms 10_000
   @terminal_workspace_reconciliation_interval_ms :timer.minutes(5)
   # Slightly above the dashboard render interval so "checking now…" can render.
@@ -45,6 +47,7 @@ defmodule SymphonyElixir.Orchestrator do
       admission_command: nil,
       admission_context: nil,
       admission: :unchecked,
+      foreign_claims: %{},
       tracker_task: nil,
       tracker_context: nil,
       dispatch_queue: [],
@@ -208,6 +211,7 @@ defmodule SymphonyElixir.Orchestrator do
         do: :idle,
         else: admission
 
+    {state, admission} = apply_foreign_claim(state, admission)
     state = %{state | admission_task: nil, admission: admission}
 
     if admission == :available and state.admission_context != nil and state.admission_context.candidate != nil,
@@ -727,6 +731,52 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # Exit status 76 from the admission command means another scheduler (e.g. a
+  # peer host sharing the same tracker) already owns the candidate. Skip it for
+  # agent.foreign_claim_ttl_ms and re-poll so the next candidate is considered,
+  # instead of head-of-line blocking on work this host must never start.
+  defp apply_foreign_claim(state, {:foreign_claim, message}) do
+    candidate = state.admission_context && state.admission_context.candidate
+    issue_id = candidate && candidate[:id]
+
+    cond do
+      issue_id == nil ->
+        {state, {:waiting, message}}
+
+      Map.has_key?(state.running, issue_id) or Map.has_key?(state.retry_attempts, issue_id) ->
+        Logger.warning("Host admission reported a foreign claim on locally owned #{candidate.identifier}; waiting instead of skipping: #{message}")
+
+        {state, {:waiting, message}}
+
+      true ->
+        ttl_ms = Config.settings!().agent.foreign_claim_ttl_ms
+        expires_at_ms = System.monotonic_time(:millisecond) + ttl_ms
+        Logger.info("Host admission: #{candidate.identifier} claimed elsewhere; skipping for #{ttl_ms}ms: #{message}")
+        send(self(), :run_poll_cycle)
+        {%{state | foreign_claims: Map.put(state.foreign_claims, issue_id, expires_at_ms)}, :unchecked}
+    end
+  end
+
+  defp apply_foreign_claim(state, admission), do: {state, admission}
+
+  defp prune_foreign_claims(state, now_ms) do
+    %{state | foreign_claims: Map.filter(state.foreign_claims, fn {_id, expires_at_ms} -> expires_at_ms > now_ms end)}
+  end
+
+  defp claimed_here_or_elsewhere?(state, issue_id, now_ms) do
+    MapSet.member?(state.claimed, issue_id) or foreign_claimed?(state, issue_id, now_ms)
+  end
+
+  defp foreign_claimed?(state, issue_id, now_ms) do
+    case Map.get(state.foreign_claims, issue_id) do
+      expires_at_ms when is_integer(expires_at_ms) ->
+        expires_at_ms > now_ms and not Map.has_key?(state.retry_attempts, issue_id)
+
+      _ ->
+        false
+    end
+  end
+
   defp admission_context(state, issue) do
     workspace = fn entry ->
       %{identifier: entry.identifier, workspace: Path.join(Config.local_workspace_root(), Workspace.workspace_key(entry))}
@@ -735,7 +785,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       version: 1,
       owner_pid: String.to_integer(System.pid()),
-      candidate: if(issue, do: workspace.(issue)),
+      candidate: if(issue, do: Map.put(workspace.(issue), :id, issue.id)),
       running: state.running |> Map.values() |> Enum.map(workspace) |> Enum.sort(),
       identity: if(issue, do: Workspace.resume_identity(issue)),
       workers: Config.settings!().worker.ssh_hosts
@@ -747,6 +797,9 @@ defmodule SymphonyElixir.Orchestrator do
       {output, 0} ->
         if String.trim(output) != "", do: Logger.info("Host admission: #{String.slice(String.trim(output), 0, 1_000)}")
         :available
+
+      {output, @foreign_claim_exit_status} ->
+        {:foreign_claim, String.slice(String.trim(output), 0, 1_000)}
 
       {output, _status} ->
         {:waiting, String.slice(String.trim(output), 0, 1_000)}
@@ -1201,6 +1254,7 @@ defmodule SymphonyElixir.Orchestrator do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
     now_ms = System.monotonic_time(:millisecond)
+    state = prune_foreign_claims(state, now_ms)
 
     candidates =
       issues
@@ -1395,14 +1449,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp eligible_issue?(
          %Issue{} = issue,
-         %State{running: running, claimed: claimed, blocked: blocked} = state,
+         %State{running: running, blocked: blocked} = state,
          active_states,
          terminal_states,
          now_ms
        )
        when is_integer(now_ms) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !MapSet.member?(claimed, issue.id) and
+      !claimed_here_or_elsewhere?(state, issue.id, now_ms) and
       retry_due?(state, issue.id, now_ms) and
       state.exception_error == nil and
       !Map.has_key?(running, issue.id) and
@@ -1926,6 +1980,13 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp foreign_claims_snapshot(state, now_ms) do
+    state.foreign_claims
+    |> Enum.filter(fn {_id, expires_at_ms} -> expires_at_ms > now_ms end)
+    |> Enum.map(fn {issue_id, expires_at_ms} -> %{issue_id: issue_id, expires_in_ms: expires_at_ms - now_ms} end)
+    |> Enum.sort_by(& &1.issue_id)
+  end
+
   defp admission_snapshot({:waiting, reason}), do: %{status: "waiting", reason: reason}
   defp admission_snapshot(status), do: %{status: to_string(status), reason: nil}
 
@@ -2018,6 +2079,7 @@ defmodule SymphonyElixir.Orchestrator do
     {:reply,
      %{
        admission: admission_snapshot(state.admission),
+       foreign_claims: foreign_claims_snapshot(state, now_ms),
        running: running,
        retrying: retrying,
        blocked: blocked,

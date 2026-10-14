@@ -27,7 +27,11 @@ asynchronously after candidate selection, bounded to 90 seconds (plus a
 five-second process-group kill allowance, using the host `timeout` command).
 Exit zero admits work; missing executables, failures and stale results mean host
 waiting. Polling/reconciliation remain responsive; labels and retry counts are
-unchanged by host waiting. The snapshot/API exposes `admission.status` and `reason`.
+unchanged by host waiting. The snapshot/API exposes `admission.status` and `reason`. Exit 76
+means another scheduler already claimed the candidate (`candidate.id` is in
+`SYMPHONY_ADMISSION_CONTEXT`): it is skipped for `agent.foreign_claim_ttl_ms`
+(default 600000) and the next candidate is checked immediately; locally running or
+retrying work is never skipped. Active skips appear in the snapshot as `foreign_claims`.
 
 Retries become eligible only when their backoff is due and are preferred within
 the same effective priority after preserved workspaces. The oldest due checkpoint runs first, so another retry

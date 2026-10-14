@@ -137,6 +137,102 @@ defmodule SymphonyElixir.AdmissionTest do
     assert {:ok, [^issue]} = Tracker.fetch_issues_by_states(["Todo"])
   end
 
+  test "exit 76 skips a foreign-claimed candidate and admits the next one", %{root: root} do
+    requests = Path.join(root, "requests")
+    marker = Path.join(root, "dispatched")
+    first = %Issue{id: "one", identifier: "ONE", title: "first", state: "Todo", dispatchable: true, priority: 1}
+    second = %Issue{id: "two", identifier: "TWO", title: "second", state: "Todo", dispatchable: true, priority: 2}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [first, second])
+
+    configure(
+      "printf '%s\\n' \"$SYMPHONY_ADMISSION_CONTEXT\" >> '#{requests}'; " <>
+        "case \"$SYMPHONY_ADMISSION_CONTEXT\" in *'\"identifier\":\"ONE\"'*) echo claimed-by-adama; exit 76;; esac",
+      hook_after_create: "touch '#{marker}'-$SYMPHONY_ISSUE_IDENTIFIER; sleep 2; exit 1"
+    )
+
+    pid = start_supervised!({Orchestrator, name: AdmissionForeignClaim})
+    send(pid, :run_poll_cycle)
+    eventually(fn -> File.exists?("#{marker}-TWO") end, 500)
+    refute File.exists?("#{marker}-ONE")
+
+    state = :sys.get_state(pid)
+    assert Map.keys(state.foreign_claims) == ["one"]
+    assert state.foreign_claims["one"] > System.monotonic_time(:millisecond) + 590_000
+    assert %{foreign_claims: [%{issue_id: "one"}]} = GenServer.call(pid, :snapshot, 100)
+
+    contexts = requests |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    candidates = Enum.map(contexts, &get_in(&1, ["candidate", "id"]))
+    assert Enum.take(candidates, 2) == ["one", "two"]
+    assert Enum.count(candidates, &(&1 == "one")) == 1
+  end
+
+  test "a foreign claim expires and the candidate becomes eligible again", %{root: root} do
+    claimed = Path.join(root, "claimed-elsewhere")
+    requests = Path.join(root, "requests")
+    worker = Path.join(root, "worker-started")
+    File.write!(claimed, "adama")
+    issue = %Issue{id: "one", identifier: "ONE", title: "first", state: "Todo", dispatchable: true}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    configure(
+      "printf '%s\\n' \"$SYMPHONY_ADMISSION_CONTEXT\" >> '#{requests}'; " <>
+        "case \"$SYMPHONY_ADMISSION_CONTEXT\" in *'\"identifier\":\"ONE\"'*) test -f '#{claimed}' && exit 76;; esac; exit 0",
+      foreign_claim_ttl_ms: 30_000,
+      hook_after_create: "touch '#{worker}'; exit 1"
+    )
+
+    pid = start_supervised!({Orchestrator, name: AdmissionForeignExpiry})
+    send(pid, :run_poll_cycle)
+    eventually(fn -> Map.has_key?(:sys.get_state(pid).foreign_claims, "one") end, 500)
+    assert :sys.get_state(pid).foreign_claims["one"] <= System.monotonic_time(:millisecond) + 30_000
+
+    # While the claim is live, the follow-up poll probes with no candidate at all.
+    File.rm!(claimed)
+    send(pid, :run_poll_cycle)
+
+    eventually(
+      fn ->
+        requests |> File.read!() |> String.split("\n", trim: true) |> Enum.any?(&(Jason.decode!(&1)["candidate"] == nil))
+      end,
+      500
+    )
+
+    eventually(fn -> :sys.get_state(pid).admission_task == nil end, 500)
+    refute File.exists?(worker)
+
+    :sys.replace_state(pid, fn state -> %{state | foreign_claims: %{"one" => System.monotonic_time(:millisecond) - 1}} end)
+    send(pid, :run_poll_cycle)
+    eventually(fn -> File.exists?(worker) end, 500)
+    assert :sys.get_state(pid).foreign_claims == %{}
+  end
+
+  test "exit 75 still waits on the head candidate without skipping it", %{root: root} do
+    requests = Path.join(root, "requests")
+    marker = Path.join(root, "dispatched")
+    first = %Issue{id: "one", identifier: "ONE", title: "first", state: "Todo", dispatchable: true, priority: 1}
+    second = %Issue{id: "two", identifier: "TWO", title: "second", state: "Todo", dispatchable: true, priority: 2}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [first, second])
+
+    configure(
+      "printf '%s\\n' \"$SYMPHONY_ADMISSION_CONTEXT\" >> '#{requests}'; " <>
+        "case \"$SYMPHONY_ADMISSION_CONTEXT\" in *'\"identifier\":\"ONE\"'*) echo busy; exit 75;; esac",
+      hook_after_create: "touch '#{marker}'-$SYMPHONY_ISSUE_IDENTIFIER; exit 1"
+    )
+
+    pid = start_supervised!({Orchestrator, name: AdmissionForeignWait})
+    send(pid, :run_poll_cycle)
+    eventually(fn -> :sys.get_state(pid).admission == {:waiting, "busy"} end, 500)
+    send(pid, :run_poll_cycle)
+    eventually(fn -> length(File.read!(requests) |> String.split("\n", trim: true)) >= 2 end, 500)
+    eventually(fn -> :sys.get_state(pid).admission == {:waiting, "busy"} end, 500)
+
+    assert :sys.get_state(pid).foreign_claims == %{}
+    refute File.exists?("#{marker}-ONE")
+    refute File.exists?("#{marker}-TWO")
+    contexts = requests |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    assert Enum.all?(contexts, &(get_in(&1, ["candidate", "id"]) == "one"))
+  end
+
   test "capacity is probed while work is running, so later work can still start", %{root: root} do
     # The bug this pins: check_admission forced :unchecked whenever anything was
     # running, and admission_available? demands :available, so maybe_dispatch

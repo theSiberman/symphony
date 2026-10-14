@@ -210,6 +210,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  admission_command: #{yaml_value(Keyword.get(config, :admission_command))}",
+        if(ttl = Keyword.get(config, :foreign_claim_ttl_ms), do: "  foreign_claim_ttl_ms: #{yaml_value(ttl)}"),
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "  redispatch_on_transition_to: #{yaml_value(redispatch_on_transition_to)}",
