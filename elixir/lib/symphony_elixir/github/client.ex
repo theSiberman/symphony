@@ -5,12 +5,16 @@ defmodule SymphonyElixir.GitHub.Client do
 
   require Logger
   alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub.HttpCache
   alias SymphonyElixir.Tracker.Issue
 
   @default_api_url "https://api.github.com"
   @api_version "2022-11-28"
   @page_size 100
   @user_agent "symphony"
+  @default_enrichment_concurrency 8
+  @retryable_statuses [408, 500, 502, 503, 504]
+  @retryable_transport_reasons [:timeout, :econnrefused, :closed]
 
   @doc "Resolves repository identity for scheduler-owned mutation bindings."
   @spec repository_identity(map()) :: {String.t() | nil, String.t() | nil}
@@ -79,6 +83,15 @@ defmodule SymphonyElixir.GitHub.Client do
   def fetch_issues_by_ids_for_test(issue_ids, tracker_settings, request_fun)
       when is_list(issue_ids) and is_map(tracker_settings) and is_function(request_fun, 5) do
     fetch_issues_by_ids(issue_ids, tracker_settings, request_fun)
+  end
+
+  @doc false
+  @spec request_for_test(String.t(), String.t(), map(), term(), map(), keyword()) ::
+          {:ok, %{status: integer(), body: term()}} | {:error, term()}
+  def request_for_test(method, path, params, body, tracker_settings, req_options) do
+    with {:ok, github_settings} <- settings(tracker_settings) do
+      perform_request(method, path, params, body, github_settings, req_options)
+    end
   end
 
   defp fetch_issues_by_states(state_names, tracker_settings, request_fun) do
@@ -176,17 +189,37 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  # Enrichment costs three sequential GETs per issue, so candidates are
+  # enriched concurrently. Results keep input order and the first error (in
+  # input order) halts the stream, matching the former sequential semantics.
   defp enrich_and_filter_candidates(issues, settings, request_fun) do
-    Enum.reduce_while(issues, {:ok, []}, fn issue, {:ok, acc} ->
-      issue
-      |> enrich_issue(settings, request_fun)
-      |> reduce_enriched_candidate(acc, settings)
+    issues
+    |> Task.async_stream(&enrich_candidate(&1, settings, request_fun),
+      max_concurrency: settings.enrichment_concurrency,
+      ordered: true,
+      timeout: :infinity
+    )
+    |> Enum.reduce_while({:ok, []}, fn {:ok, result}, {:ok, acc} ->
+      reduce_enriched_candidate(result, acc, settings)
     end)
     |> case do
       {:ok, enriched} -> {:ok, Enum.reverse(enriched)}
       error -> error
     end
   end
+
+  # An issue carrying an excluded label can never be routed or donate
+  # priority, so its structure is never consulted; skip its three GETs.
+  defp enrich_candidate(%Issue{labels: labels} = issue, %{excluded_labels: [_ | _] = excluded} = settings, request_fun)
+       when is_list(labels) do
+    if Enum.any?(labels, &(&1 in excluded)) do
+      {:ok, %{issue | dispatchable: false, priority_inheritable: false}}
+    else
+      enrich_issue(issue, settings, request_fun)
+    end
+  end
+
+  defp enrich_candidate(issue, settings, request_fun), do: enrich_issue(issue, settings, request_fun)
 
   defp reduce_enriched_candidate({:ok, %Issue{} = issue}, acc, _settings),
     do: {:cont, {:ok, [issue | acc]}}
@@ -509,24 +542,130 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp perform_request(method, path, params, body, settings) do
-    with {:ok, request_method} <- request_method(method) do
+  defp perform_request(method, path, params, body, settings),
+    do: perform_request(method, path, params, body, settings, [])
+
+  defp perform_request(method, path, params, body, settings, req_options) do
+    with {:ok, request_method} <- request_method(method),
+         :ok <- check_rate_limit(method, path, settings) do
+      cache_key = conditional_cache_key(request_method, path, params, settings)
+      cached = if cache_key, do: HttpCache.lookup(cache_key)
+
       request_opts = [
         method: request_method,
         url: settings.api_url <> path,
-        headers: github_headers(settings.token),
+        headers: github_headers(settings.token) ++ conditional_headers(cached),
         params: params,
-        connect_options: [timeout: 30_000]
+        connect_options: [timeout: 30_000],
+        retry: &retry_transient?/2
       ]
 
       request_opts = if is_nil(body), do: request_opts, else: Keyword.put(request_opts, :json, body)
 
-      case Req.request(request_opts) do
-        {:ok, response} -> {:ok, %{status: response.status, body: response.body}}
+      case Req.request(Keyword.merge(request_opts, req_options)) do
+        {:ok, response} -> {:ok, handle_response(response, cache_key, cached, method, path, settings)}
         {:error, reason} -> {:error, {:github_api_request, reason}}
       end
     end
   end
+
+  # Only GET is cached. 304 responses do not count against GitHub's primary
+  # rate limit, so revalidating with If-None-Match is effectively free. The
+  # token is hashed into the key so different credentials never share bodies.
+  # Pagination is driven by explicit page params (part of the key) and body
+  # length, so caching the decoded body alone is sufficient.
+  defp conditional_cache_key(:get, path, params, settings) do
+    normalized_params = params |> Enum.map(fn {key, value} -> {to_string(key), to_string(value)} end) |> Enum.sort()
+    {settings.api_url, :erlang.phash2(settings.token), path, normalized_params}
+  end
+
+  defp conditional_cache_key(_method, _path, _params, _settings), do: nil
+
+  defp conditional_headers({etag, _body}), do: [{"If-None-Match", etag}]
+  defp conditional_headers(nil), do: []
+
+  defp handle_response(%{status: 304}, _cache_key, {_etag, cached_body}, _method, _path, _settings) do
+    %{status: 200, body: cached_body}
+  end
+
+  defp handle_response(%{status: status} = response, cache_key, _cached, method, path, settings) do
+    cond do
+      status in 200..299 and cache_key != nil ->
+        case Req.Response.get_header(response, "etag") do
+          [etag | _] when is_binary(etag) and etag != "" -> HttpCache.store(cache_key, etag, response.body)
+          _ -> :ok
+        end
+
+      status in [403, 429] ->
+        maybe_block_rate_limited(response, method, path, settings)
+
+      true ->
+        :ok
+    end
+
+    %{status: status, body: response.body}
+  end
+
+  # When GitHub reports an exhausted bucket (or a secondary limit with
+  # Retry-After), stop calling that endpoint shape until the reset time
+  # instead of spending further requests on guaranteed 403/429s.
+  defp maybe_block_rate_limited(response, method, path, settings) do
+    now = System.system_time(:second)
+    remaining = response |> Req.Response.get_header("x-ratelimit-remaining") |> header_integer()
+    reset = response |> Req.Response.get_header("x-ratelimit-reset") |> header_integer()
+    retry_after = response |> Req.Response.get_header("retry-after") |> header_integer()
+
+    until =
+      cond do
+        is_integer(retry_after) -> now + retry_after
+        remaining == 0 and is_integer(reset) -> reset
+        true -> nil
+      end
+
+    if is_integer(until) and until > now do
+      Logger.warning("GitHub rate limit hit; pausing requests until=#{until} method=#{method} path=#{path}")
+      HttpCache.block(rate_limit_scope(path, settings), until)
+    end
+  end
+
+  defp check_rate_limit(method, path, settings) do
+    case HttpCache.blocked_until(rate_limit_scope(path, settings), System.system_time(:second)) do
+      nil ->
+        :ok
+
+      until ->
+        Logger.debug("Skipping rate-limited GitHub request until=#{until} method=#{method} path=#{path}")
+        {:error, {:github_rate_limited, until}}
+    end
+  end
+
+  # Rate-limit buckets differ per endpoint family, so block by endpoint
+  # shape (numeric path segments collapsed) rather than globally.
+  defp rate_limit_scope(path, settings) do
+    {settings.api_url, :erlang.phash2(settings.token), String.replace(path, ~r{/\d+(?=/|$)}, "/:n")}
+  end
+
+  defp header_integer([value | _]) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {int, ""} -> int
+      _ -> nil
+    end
+  end
+
+  defp header_integer(_values), do: nil
+
+  # Req's default retry also retries 429 and sleeps for Retry-After; rate
+  # limits are handled above, so only retry genuinely transient failures.
+  defp retry_transient?(%Req.Request{method: method}, response_or_exception) when method in [:get, :head] do
+    case response_or_exception do
+      %Req.Response{status: status} -> status in @retryable_statuses
+      %Req.TransportError{reason: reason} -> reason in @retryable_transport_reasons
+      %Req.HTTPError{protocol: :http2, reason: :unprocessed} -> true
+      _ -> false
+    end
+  end
+
+  defp retry_transient?(_request, _response_or_exception), do: false
 
   defp settings(tracker_settings) when is_map(tracker_settings) do
     provider = provider_settings(tracker_settings)
@@ -534,6 +673,8 @@ defmodule SymphonyElixir.GitHub.Client do
     repo = resolve_setting(provider["repo"], System.get_env("GITHUB_REPO"))
     token = resolve_setting(provider["token"], System.get_env("GITHUB_TOKEN"))
     spec_issue_number = provider["spec_issue_number"]
+
+    enrichment_concurrency = Map.get(provider, "enrichment_concurrency", @default_enrichment_concurrency)
 
     cond do
       not valid_api_url?(api_url) ->
@@ -551,16 +692,27 @@ defmodule SymphonyElixir.GitHub.Client do
       not valid_spec_issue_number?(spec_issue_number) ->
         {:error, :invalid_github_spec_issue_number}
 
+      not valid_enrichment_concurrency?(enrichment_concurrency) ->
+        {:error, :invalid_github_enrichment_concurrency}
+
       true ->
         {:ok,
          %{
            api_url: String.trim_trailing(api_url, "/"),
            repo: repo,
            token: token,
-           spec_issue_number: spec_issue_number
+           spec_issue_number: spec_issue_number,
+           enrichment_concurrency: enrichment_concurrency,
+           excluded_labels: excluded_labels(tracker_settings)
          }}
     end
   end
+
+  defp excluded_labels(%{excluded_labels: labels}) when is_list(labels) do
+    for label <- labels, is_binary(label), do: label |> String.trim() |> String.downcase()
+  end
+
+  defp excluded_labels(_tracker_settings), do: []
 
   defp provider_settings(%{provider: provider}) when is_map(provider), do: provider
   defp provider_settings(_tracker_settings), do: %{}
@@ -603,6 +755,7 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp valid_api_url?(_value), do: false
+  defp valid_enrichment_concurrency?(value), do: is_integer(value) and value > 0
   defp valid_spec_issue_number?(nil), do: true
   defp valid_spec_issue_number?(value), do: is_integer(value) and value >= 0
   defp valid_repo?(repo) when is_binary(repo), do: String.match?(repo, ~r/^[^\s\/]+\/[^\s\/]+$/)

@@ -4,6 +4,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
   alias SymphonyElixir.GitHub.Adapter, as: GitHubAdapter
   alias SymphonyElixir.GitHub.AgentTool, as: GitHubAgentTool
   alias SymphonyElixir.GitHub.Client, as: GitHubClient
+  alias SymphonyElixir.GitHub.HttpCache
 
   defmodule FakeGitHubClient do
     def fetch_issues_by_states(states) do
@@ -459,6 +460,215 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     refute issue.dispatchable
     assert issue.blocked_by == [%{"id" => 1041, "identifier" => "GH-41", "state" => "open"}]
+  end
+
+  test "label-state enrichment runs concurrently, keeps input order, and bounds concurrency" do
+    numbers = Enum.to_list(1..20)
+    in_flight = :atomics.new(2, [])
+
+    request_fun = fn
+      "GET", "/repos/octo/repo/issues", %{"labels" => "ready-for-agent"}, nil, _settings ->
+        {:ok, %{status: 200, body: Enum.map(numbers, &raw_issue/1)}}
+
+      "GET", "/repos/octo/repo/issues/" <> rest, _params, nil, _settings ->
+        current = :atomics.add_get(in_flight, 1, 1)
+        update_max(in_flight, current)
+        [number | _] = String.split(rest, "/")
+        Process.sleep(rem(String.to_integer(number) * 7, 11))
+        :atomics.sub(in_flight, 1, 1)
+
+        if String.ends_with?(rest, "/parent"),
+          do: {:ok, %{status: 404, body: %{}}},
+          else: {:ok, %{status: 200, body: []}}
+    end
+
+    settings = %{
+      tracker_settings(%{"state_source" => "labels", "enrichment_concurrency" => 4})
+      | active_states: ["ready-for-agent"],
+        terminal_states: ["closed"]
+    }
+
+    assert {:ok, issues} = GitHubClient.fetch_issues_by_states_for_test(settings.active_states, settings, request_fun)
+
+    expected_order = numbers |> Map.new(&{Integer.to_string(&1), Integer.to_string(&1)}) |> Map.values()
+    assert Enum.map(issues, & &1.id) == expected_order
+    assert Enum.all?(issues, & &1.dispatchable)
+    max_in_flight = :atomics.get(in_flight, 2)
+    assert max_in_flight > 1
+    assert max_in_flight <= 4
+  end
+
+  test "label-state enrichment reports the first failing issue in input order" do
+    request_fun = fn
+      "GET", "/repos/octo/repo/issues", %{"labels" => "ready-for-agent"}, nil, _settings ->
+        {:ok, %{status: 200, body: Enum.map(1..6, &raw_issue/1)}}
+
+      "GET", "/repos/octo/repo/issues/2/parent", _params, nil, _settings ->
+        Process.sleep(50)
+        {:ok, %{status: 502, body: %{}}}
+
+      "GET", "/repos/octo/repo/issues/5/parent", _params, nil, _settings ->
+        {:ok, %{status: 503, body: %{}}}
+
+      "GET", "/repos/octo/repo/issues/" <> rest, _params, nil, _settings ->
+        if String.ends_with?(rest, "/parent"),
+          do: {:ok, %{status: 404, body: %{}}},
+          else: {:ok, %{status: 200, body: []}}
+    end
+
+    settings = %{
+      tracker_settings(%{"state_source" => "labels"})
+      | active_states: ["ready-for-agent"],
+        terminal_states: ["closed"]
+    }
+
+    assert {:error, {:github_api_status, 502}} =
+             GitHubClient.fetch_issues_by_states_for_test(settings.active_states, settings, request_fun)
+
+    assert {:error, :invalid_github_enrichment_concurrency} =
+             GitHubClient.validate_settings(tracker_settings(%{"enrichment_concurrency" => 0}))
+  end
+
+  test "label-state enrichment skips issues carrying an excluded label" do
+    excluded_issue = Map.put(raw_issue(43), "labels", [%{"name" => "ready-for-agent"}, %{"name" => " Blocked-Human "}])
+
+    request_fun = fn
+      "GET", "/repos/octo/repo/issues", %{"labels" => "ready-for-agent"}, nil, _settings ->
+        {:ok, %{status: 200, body: [raw_issue(42), excluded_issue]}}
+
+      "GET", "/repos/octo/repo/issues/42/parent", _params, nil, _settings ->
+        {:ok, %{status: 404, body: %{}}}
+
+      "GET", "/repos/octo/repo/issues/42/" <> _rest, _params, nil, _settings ->
+        {:ok, %{status: 200, body: []}}
+    end
+
+    settings =
+      tracker_settings(%{"state_source" => "labels"})
+      |> Map.merge(%{active_states: ["ready-for-agent"], terminal_states: ["closed"], excluded_labels: ["blocked-human"]})
+
+    assert {:ok, issues} = GitHubClient.fetch_issues_by_states_for_test(settings.active_states, settings, request_fun)
+    assert %{dispatchable: true} = Enum.find(issues, &(&1.id == "42"))
+    assert %{dispatchable: false, priority_inheritable: false} = Enum.find(issues, &(&1.id == "43"))
+  end
+
+  test "GET requests revalidate with If-None-Match and reuse the cached body on 304" do
+    parent = self()
+    settings = tracker_settings(%{"token" => "etag-token-#{System.unique_integer([:positive])}"})
+
+    plug = fn conn ->
+      if_none_match = Plug.Conn.get_req_header(conn, "if-none-match")
+      send(parent, {:github_conditional, conn.method, conn.request_path, conn.query_string, if_none_match})
+
+      case if_none_match do
+        [~s(W/"v1")] ->
+          Plug.Conn.send_resp(conn, 304, "")
+
+        [] ->
+          conn
+          |> Plug.Conn.put_resp_header("etag", ~s(W/"v1"))
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(200, Jason.encode!([%{"number" => 1}]))
+      end
+    end
+
+    path = "/repos/octo/repo/issues/9/sub_issues"
+    params = %{"page" => 1, "per_page" => 100}
+    get = &GitHubClient.request_for_test("GET", path, &1, nil, settings, plug: plug)
+
+    assert {:ok, %{status: 200, body: [%{"number" => 1}]}} = get.(params)
+    assert_received {:github_conditional, "GET", ^path, _query, []}
+
+    assert {:ok, %{status: 200, body: [%{"number" => 1}]}} = get.(params)
+    assert_received {:github_conditional, "GET", ^path, _query, [~s(W/"v1")]}
+
+    # Each page is cached independently.
+    assert {:ok, %{status: 200}} = get.(%{params | "page" => 2})
+    assert_received {:github_conditional, "GET", ^path, query, []}
+    assert query =~ "page=2"
+
+    # Non-GET requests are never conditional.
+    post_plug = fn conn ->
+      send(parent, {:github_conditional, conn.method, conn.request_path, conn.query_string, Plug.Conn.get_req_header(conn, "if-none-match")})
+      conn |> Plug.Conn.put_resp_content_type("application/json") |> Plug.Conn.send_resp(201, "{}")
+    end
+
+    assert {:ok, %{status: 201}} = GitHubClient.request_for_test("POST", path, %{}, %{"x" => 1}, settings, plug: post_plug)
+    assert_received {:github_conditional, "POST", ^path, _query, []}
+  end
+
+  test "an exhausted rate limit pauses that endpoint family until reset" do
+    parent = self()
+    settings = tracker_settings(%{"token" => "limit-token-#{System.unique_integer([:positive])}"})
+    reset = System.system_time(:second) + 120
+
+    plug = fn conn ->
+      send(parent, {:github_hit, conn.request_path})
+
+      if String.ends_with?(conn.request_path, "/sub_issues") do
+        conn
+        |> Plug.Conn.put_resp_header("x-ratelimit-remaining", "0")
+        |> Plug.Conn.put_resp_header("x-ratelimit-reset", Integer.to_string(reset))
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(403, Jason.encode!(%{"message" => "API rate limit exceeded"}))
+      else
+        conn |> Plug.Conn.put_resp_content_type("application/json") |> Plug.Conn.send_resp(200, "[]")
+      end
+    end
+
+    assert {:ok, %{status: 403}} = GitHubClient.request_for_test("GET", "/repos/octo/repo/issues/1/sub_issues", %{}, nil, settings, plug: plug)
+    assert_received {:github_hit, "/repos/octo/repo/issues/1/sub_issues"}
+
+    assert {:error, {:github_rate_limited, ^reset}} =
+             GitHubClient.request_for_test("GET", "/repos/octo/repo/issues/2/sub_issues", %{}, nil, settings, plug: plug)
+
+    refute_received {:github_hit, _}
+
+    assert {:ok, %{status: 200}} = GitHubClient.request_for_test("GET", "/repos/octo/repo/issues/2/parent", %{}, nil, settings, plug: plug)
+    assert_received {:github_hit, "/repos/octo/repo/issues/2/parent"}
+  end
+
+  test "http cache degrades to misses when its table is unavailable" do
+    key = {:test, System.unique_integer([:positive])}
+    assert :ok = HttpCache.store(key, ~s("e"), [1])
+    assert HttpCache.lookup(key) == {~s("e"), [1]}
+    assert :ok = HttpCache.block(key, 10)
+    assert HttpCache.blocked_until(key, 5) == 10
+    assert HttpCache.blocked_until(key, 10) == nil
+
+    pid = Process.whereis(HttpCache)
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}
+
+    assert HttpCache.lookup(key) == nil
+    assert HttpCache.store(key, ~s("e"), [1]) == :ok
+    assert HttpCache.blocked_until(key, 0) == nil
+    assert HttpCache.clear() == :ok
+
+    wait_until(fn -> is_pid(Process.whereis(HttpCache)) and Process.whereis(HttpCache) != pid end)
+    assert HttpCache.lookup({:fresh, make_ref()}) == nil
+  end
+
+  defp wait_until(fun, attempts \\ 100) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("condition not met")
+      true -> wait_again(fun, attempts)
+    end
+  end
+
+  defp wait_again(fun, attempts) do
+    Process.sleep(10)
+    wait_until(fun, attempts - 1)
+  end
+
+  defp update_max(atomics, current) do
+    previous = :atomics.get(atomics, 2)
+
+    if current > previous and :atomics.compare_exchange(atomics, 2, previous, current) != :ok do
+      update_max(atomics, current)
+    end
   end
 
   test "github_api preserves REST status and body while rejecting unsafe arguments" do
