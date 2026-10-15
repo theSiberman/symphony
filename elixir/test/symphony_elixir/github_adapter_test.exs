@@ -269,8 +269,14 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
         assert label in ["ready-for-agent", "in-progress"]
         {:ok, %{status: 200, body: [raw_issue(42), raw_issue(43)]}}
 
+      "GET", "/repos/octo/repo/issues/42", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: Map.put(raw_issue(42), "parent_issue_url", "https://api.github.test/repos/octo/repo/issues/7")}}
+
       "GET", "/repos/octo/repo/issues/42/parent", %{}, nil, _settings ->
         {:ok, %{status: 200, body: raw_issue(7)}}
+
+      "GET", "/repos/octo/repo/issues/43", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: Map.put(raw_issue(43), "parent_issue_url", nil)}}
 
       "GET", "/repos/octo/repo/issues/43/parent", %{}, nil, _settings ->
         {:ok, %{status: 404, body: %{"message" => "No parent issue found"}}}
@@ -335,6 +341,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     refreshed =
       raw_issue(42)
       |> Map.put("labels", [%{"name" => "In-Progress"}])
+      |> Map.put("parent_issue_url", "https://api.github.test/repos/octo/repo/issues/7")
 
     request_fun = fn
       "GET", "/repos/octo/repo/issues/42", %{}, nil, _settings ->
@@ -371,6 +378,9 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
         issue = raw_issue(7) |> Map.put("labels", [%{"name" => "In-Progress"}])
         {:ok, %{status: 200, body: [issue]}}
 
+      "GET", "/repos/octo/repo/issues/7", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: Map.put(raw_issue(7), "parent_issue_url", nil)}}
+
       "GET", "/repos/octo/repo/issues/7/parent", %{}, nil, _settings ->
         {:ok, %{status: 404, body: %{}}}
 
@@ -398,6 +408,9 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     request_fun = fn
       "GET", "/repos/octo/repo/issues", %{"labels" => "ready-for-agent"}, nil, _settings ->
         {:ok, %{status: 200, body: [raw_issue(42)]}}
+
+      "GET", "/repos/octo/repo/issues/42", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: Map.put(raw_issue(42), "parent_issue_url", "https://api.github.test/repos/octo/repo/issues/7")}}
 
       "GET", "/repos/octo/repo/issues/42/parent", %{}, nil, _settings ->
         {:ok, %{status: 200, body: raw_issue(7)}}
@@ -430,6 +443,9 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     request_fun = fn
       "GET", "/repos/octo/repo/issues", %{"labels" => "ready-for-agent"}, nil, _settings ->
         {:ok, %{status: 200, body: [raw_issue(42)]}}
+
+      "GET", "/repos/octo/repo/issues/42", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: Map.put(raw_issue(42), "parent_issue_url", nil)}}
 
       "GET", "/repos/octo/repo/issues/42/parent", %{}, nil, _settings ->
         {:ok, %{status: 404, body: %{}}}
@@ -503,9 +519,15 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
       "GET", "/repos/octo/repo/issues", %{"labels" => "ready-for-agent"}, nil, _settings ->
         {:ok, %{status: 200, body: Enum.map(1..6, &raw_issue/1)}}
 
+      "GET", "/repos/octo/repo/issues/2", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: Map.put(raw_issue(2), "parent_issue_url", "https://x/7")}}
+
       "GET", "/repos/octo/repo/issues/2/parent", _params, nil, _settings ->
         Process.sleep(50)
         {:ok, %{status: 502, body: %{}}}
+
+      "GET", "/repos/octo/repo/issues/5", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: Map.put(raw_issue(5), "parent_issue_url", "https://x/7")}}
 
       "GET", "/repos/octo/repo/issues/5/parent", _params, nil, _settings ->
         {:ok, %{status: 503, body: %{}}}
@@ -535,6 +557,9 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     request_fun = fn
       "GET", "/repos/octo/repo/issues", %{"labels" => "ready-for-agent"}, nil, _settings ->
         {:ok, %{status: 200, body: [raw_issue(42), excluded_issue]}}
+
+      "GET", "/repos/octo/repo/issues/42", %{}, nil, _settings ->
+        {:ok, %{status: 200, body: Map.put(raw_issue(42), "parent_issue_url", nil)}}
 
       "GET", "/repos/octo/repo/issues/42/parent", _params, nil, _settings ->
         {:ok, %{status: 404, body: %{}}}
@@ -843,6 +868,142 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
       active_states: ["open"],
       terminal_states: ["closed"]
     }
+  end
+
+  describe "lean enrichment" do
+    defp lean_settings do
+      %{
+        tracker_settings(%{"state_source" => "labels"})
+        | active_states: ["ready-for-agent"],
+          terminal_states: ["closed"]
+      }
+    end
+
+    defp lean_poll(listed, extra) do
+      test_pid = self()
+
+      request_fun = fn
+        "GET", "/repos/octo/repo/issues", _params, nil, _settings ->
+          {:ok, %{status: 200, body: [listed]}}
+
+        "GET", path, params, nil, settings ->
+          send(test_pid, {:call, path})
+
+          case extra.(path, params, settings) do
+            nil -> {:ok, %{status: 200, body: []}}
+            response -> response
+          end
+      end
+
+      settings = lean_settings()
+      {GitHubClient.fetch_issues_by_states_for_test(settings.active_states, settings, request_fun), drain_calls([])}
+    end
+
+    defp drain_calls(acc) do
+      receive do
+        {:call, path} -> drain_calls([path | acc])
+      after
+        0 -> Enum.reverse(acc)
+      end
+    end
+
+    defp zero_summaries(issue) do
+      issue
+      |> Map.put("sub_issues_summary", %{"total" => 0, "completed" => 0, "percent_completed" => 0})
+      |> Map.put("issue_dependencies_summary", %{
+        "blocked_by" => 0,
+        "blocking" => 0,
+        "total_blocked_by" => 0,
+        "total_blocking" => 0
+      })
+    end
+
+    test "zero summaries skip sub_issues and blocked_by; parent via cacheable issue GET" do
+      extra = fn
+        "/repos/octo/repo/issues/42", _, _ -> {:ok, %{status: 200, body: Map.put(raw_issue(42), "parent_issue_url", nil)}}
+        _, _, _ -> nil
+      end
+
+      assert {{:ok, [issue]}, calls} = lean_poll(zero_summaries(raw_issue(42)), extra)
+      assert calls == ["/repos/octo/repo/issues/42"]
+      refute issue.native_ref["has_parent"]
+      refute issue.native_ref["has_sub_issues"]
+      refute Map.has_key?(issue.native_ref, "enrich_hints")
+      assert issue.blocked_by == []
+      assert issue.dispatchable
+    end
+
+    test "issue GET with a parent url triggers the parent fetch" do
+      extra = fn
+        "/repos/octo/repo/issues/42", _, _ ->
+          {:ok, %{status: 200, body: Map.put(raw_issue(42), "parent_issue_url", "https://api.github.test/repos/octo/repo/issues/7")}}
+
+        "/repos/octo/repo/issues/42/parent", _, _ ->
+          {:ok, %{status: 200, body: raw_issue(7)}}
+
+        _, _, _ ->
+          nil
+      end
+
+      assert {{:ok, [issue]}, calls} = lean_poll(zero_summaries(raw_issue(42)), extra)
+      assert calls == ["/repos/octo/repo/issues/42", "/repos/octo/repo/issues/42/parent"]
+      assert issue.native_ref["parent_number"] == 7
+    end
+
+    test "parent_issue_url null in the payload makes no parent call and no issue GET" do
+      listed = raw_issue(42) |> zero_summaries() |> Map.put("parent_issue_url", nil)
+      assert {{:ok, [issue]}, []} = lean_poll(listed, fn _, _, _ -> nil end)
+      refute issue.native_ref["has_parent"]
+    end
+
+    test "parent_issue_url present in the payload fetches /parent without an issue GET" do
+      listed =
+        raw_issue(42)
+        |> zero_summaries()
+        |> Map.put("parent_issue_url", "https://api.github.test/repos/octo/repo/issues/7")
+
+      extra = fn
+        "/repos/octo/repo/issues/42/parent", _, _ -> {:ok, %{status: 200, body: raw_issue(7)}}
+        _, _, _ -> nil
+      end
+
+      assert {{:ok, [issue]}, ["/repos/octo/repo/issues/42/parent"]} = lean_poll(listed, extra)
+      assert issue.native_ref["parent_number"] == 7
+    end
+
+    test "positive summaries still fetch sub_issues and blockers" do
+      listed =
+        raw_issue(42)
+        |> Map.put("parent_issue_url", nil)
+        |> Map.put("sub_issues_summary", %{"total" => 1})
+        |> Map.put("issue_dependencies_summary", %{"total_blocked_by" => 1})
+
+      extra = fn
+        "/repos/octo/repo/issues/42/sub_issues", _, _ -> {:ok, %{status: 200, body: [raw_issue(44)]}}
+        "/repos/octo/repo/issues/42/dependencies/blocked_by", _, _ -> {:ok, %{status: 200, body: [raw_issue(41)]}}
+        _, _, _ -> nil
+      end
+
+      assert {{:ok, [issue]}, calls} = lean_poll(listed, extra)
+      assert "/repos/octo/repo/issues/42/sub_issues" in calls
+      assert "/repos/octo/repo/issues/42/dependencies/blocked_by" in calls
+      assert issue.native_ref["sub_issue_numbers"] == [44]
+      refute issue.dispatchable
+    end
+
+    test "missing or malformed summaries fall back to fetching" do
+      listed =
+        raw_issue(42)
+        |> Map.put("parent_issue_url", nil)
+        |> Map.put("sub_issues_summary", %{"total" => "0"})
+
+      assert {{:ok, [_]}, calls} = lean_poll(listed, fn _, _, _ -> nil end)
+
+      assert calls == [
+               "/repos/octo/repo/issues/42/sub_issues",
+               "/repos/octo/repo/issues/42/dependencies/blocked_by"
+             ]
+    end
   end
 
   defp raw_issue(number) do

@@ -213,7 +213,7 @@ defmodule SymphonyElixir.GitHub.Client do
   defp enrich_candidate(%Issue{labels: labels} = issue, %{excluded_labels: [_ | _] = excluded} = settings, request_fun)
        when is_list(labels) do
     if Enum.any?(labels, &(&1 in excluded)) do
-      {:ok, %{issue | dispatchable: false, priority_inheritable: false}}
+      {:ok, %{drop_hints(issue) | dispatchable: false, priority_inheritable: false}}
     else
       enrich_issue(issue, settings, request_fun)
     end
@@ -245,22 +245,75 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp resumable_candidate?(%Issue{}), do: true
 
+  # Raw-payload hints (from list/refresh payloads) let enrichment skip calls
+  # whose answer is already known: zero sub-issues, zero blockers, and the
+  # parent link. Missing/malformed hints fall back to fetching.
+  defp enrich_hints(issue) do
+    hints =
+      %{}
+      |> put_zero_hint(issue, "sub_issues_summary", "total", "sub_issues_total")
+      |> put_zero_hint(issue, "issue_dependencies_summary", "total_blocked_by", "blocked_by_total")
+
+    if Map.has_key?(issue, "parent_issue_url"),
+      do: Map.put(hints, "parent_issue_url", issue["parent_issue_url"]),
+      else: hints
+  end
+
+  defp put_zero_hint(hints, issue, summary_key, field, hint_key) do
+    case issue[summary_key] do
+      %{^field => total} when is_integer(total) -> Map.put(hints, hint_key, total)
+      _ -> hints
+    end
+  end
+
+  defp attach_hints(native_ref, issue) do
+    case enrich_hints(issue) do
+      hints when map_size(hints) == 0 -> native_ref
+      hints -> Map.put(native_ref || %{}, "enrich_hints", hints)
+    end
+  end
+
   defp enrich_issue(%Issue{id: id} = issue, settings, request_fun) do
     base_path = repository_issue_path(settings, String.to_integer(id))
+    hints = get_in(issue.native_ref || %{}, ["enrich_hints"]) || %{}
+    issue = %{issue | native_ref: Map.delete(issue.native_ref || %{}, "enrich_hints")}
 
-    with {:ok, parent} <-
-           request_with_settings("GET", base_path <> "/parent", %{}, nil, settings, request_fun, true),
+    with {:ok, parent} <- fetch_parent(base_path, hints, settings, request_fun),
          {:ok, sub_issues} <-
-           request_with_settings("GET", base_path <> "/sub_issues", %{}, nil, settings, request_fun, false),
+           fetch_unless_zero(hints["sub_issues_total"], fn ->
+             request_with_settings("GET", base_path <> "/sub_issues", %{}, nil, settings, request_fun, false)
+           end),
          {:ok, blockers} <-
-           fetch_list_pages(
-             base_path <> "/dependencies/blocked_by",
-             settings,
-             request_fun,
-             1,
-             []
-           ) do
+           fetch_unless_zero(hints["blocked_by_total"], fn ->
+             fetch_list_pages(base_path <> "/dependencies/blocked_by", settings, request_fun, 1, [])
+           end) do
       enrich_issue_payload(issue, parent, sub_issues, blockers, settings)
+    end
+  end
+
+  defp fetch_unless_zero(0, _fun), do: {:ok, []}
+  defp fetch_unless_zero(_total, fun), do: fun.()
+
+  defp fetch_parent(base_path, hints, settings, request_fun) do
+    case Map.fetch(hints, "parent_issue_url") do
+      {:ok, nil} ->
+        {:ok, :not_found}
+
+      {:ok, url} when is_binary(url) ->
+        request_with_settings("GET", base_path <> "/parent", %{}, nil, settings, request_fun, true)
+
+      _ ->
+        # List payloads omit parent_issue_url; the single-issue GET is
+        # ETag-cacheable (304 is free), unlike a 404 from /parent.
+        with {:ok, payload} <- request_with_settings("GET", base_path, %{}, nil, settings, request_fun, false) do
+          case payload do
+            %{"parent_issue_url" => url} when is_binary(url) ->
+              request_with_settings("GET", base_path <> "/parent", %{}, nil, settings, request_fun, true)
+
+            _ ->
+              {:ok, :not_found}
+          end
+        end
     end
   end
 
@@ -418,9 +471,14 @@ defmodule SymphonyElixir.GitHub.Client do
     if label_states?(tracker_settings) do
       enrich_issue(issue, settings, request_fun)
     else
-      {:ok, issue}
+      {:ok, drop_hints(issue)}
     end
   end
+
+  defp drop_hints(%Issue{native_ref: %{} = ref} = issue),
+    do: %{issue | native_ref: Map.delete(ref, "enrich_hints")}
+
+  defp drop_hints(issue), do: issue
 
   defp issue_state(%{"state" => "closed"}, _tracker_settings), do: "closed"
 
@@ -459,7 +517,7 @@ defmodule SymphonyElixir.GitHub.Client do
          Enum.all?([issue["title"], state], &present_string?/1) do
       %Issue{
         id: Integer.to_string(issue_number),
-        native_ref: native_ref(issue, repo),
+        native_ref: issue |> native_ref(repo) |> attach_hints(issue),
         identifier: "GH-#{issue_number}",
         title: issue["title"],
         description: issue["body"],
