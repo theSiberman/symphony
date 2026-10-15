@@ -19,6 +19,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
   end
 
   setup do
+    HttpCache.clear()
     github_client_module = Application.get_env(:symphony_elixir, :github_client_module)
 
     on_exit(fn ->
@@ -854,6 +855,105 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
     assert :ok = Config.validate!()
   end
 
+  describe "enrichment memo" do
+    @parent_url "https://api.github.test/repos/octo/repo/issues/7"
+
+    defp memo_listed(numbers, overrides \\ %{}) do
+      for n <- numbers do
+        raw_issue(n)
+        |> Map.put("sub_issues_summary", %{"total" => 0})
+        |> Map.put("issue_dependencies_summary", %{"total_blocked_by" => 1, "blocked_by" => 1})
+        |> Map.put("parent_issue_url", @parent_url)
+        |> Map.merge(overrides)
+      end
+    end
+
+    defp memo_poll(listed, provider \\ %{}) do
+      test_pid = self()
+
+      request_fun = fn
+        "GET", "/repos/octo/repo/issues", _params, nil, _settings ->
+          {:ok, %{status: 200, body: listed}}
+
+        "GET", path, _params, nil, _settings ->
+          send(test_pid, {:call, path})
+
+          if String.ends_with?(path, "/dependencies/blocked_by"),
+            do: {:ok, %{status: 200, body: [Map.put(raw_issue(99), "state", "closed")]}},
+            else: {:ok, %{status: 200, body: []}}
+      end
+
+      settings = %{
+        tracker_settings(Map.merge(%{"state_source" => "labels"}, provider))
+        | active_states: ["ready-for-agent"],
+          terminal_states: ["closed"]
+      }
+
+      result = GitHubClient.fetch_issues_by_states_for_test(settings.active_states, settings, request_fun)
+      {result, drain_calls([])}
+    end
+
+    test "unchanged fingerprint makes zero calls and returns the same result" do
+      listed = memo_listed([1, 2, 3])
+      assert {{:ok, first}, calls} = memo_poll(listed)
+      assert length(calls) == 3
+      assert {{:ok, ^first}, []} = memo_poll(listed)
+    end
+
+    test "changed updated_at or summary refetches only that issue" do
+      assert {{:ok, _}, _} = memo_poll(memo_listed([1, 2, 3]))
+
+      [one, two, three] = memo_listed([1, 2, 3])
+      one = Map.put(one, "updated_at", "2026-02-02T00:00:00Z")
+      two = Map.put(two, "issue_dependencies_summary", %{"total_blocked_by" => 1, "blocked_by" => 0})
+      assert {{:ok, _}, calls} = memo_poll([one, two, three])
+      assert Enum.sort(calls) == ["/repos/octo/repo/issues/1/dependencies/blocked_by", "/repos/octo/repo/issues/2/dependencies/blocked_by"]
+    end
+
+    test "changed labels refetch" do
+      assert {{:ok, _}, _} = memo_poll(memo_listed([1]))
+      assert {{:ok, _}, [_]} = memo_poll(memo_listed([1], %{"labels" => [%{"name" => "other"}]}))
+    end
+
+    test "ttl expiry refetches" do
+      listed = memo_listed([1])
+      assert {{:ok, _}, [_]} = memo_poll(listed, %{"enrichment_memo_ttl_ms" => 30})
+      assert {{:ok, _}, []} = memo_poll(listed, %{"enrichment_memo_ttl_ms" => 30})
+      Process.sleep(60)
+      assert {{:ok, _}, [_]} = memo_poll(listed, %{"enrichment_memo_ttl_ms" => 30})
+    end
+
+    test "ttl 0 disables the memo" do
+      listed = memo_listed([1])
+      assert {{:ok, _}, [_]} = memo_poll(listed, %{"enrichment_memo_ttl_ms" => 0})
+      assert {{:ok, _}, [_]} = memo_poll(listed, %{"enrichment_memo_ttl_ms" => 0})
+    end
+
+    test "invalid ttl is rejected" do
+      assert {:error, :invalid_github_enrichment_memo_ttl_ms} =
+               GitHubClient.validate_settings(tracker_settings(%{"enrichment_memo_ttl_ms" => -1}))
+    end
+
+    test "children sharing a parent make no /parent requests" do
+      assert {{:ok, issues}, calls} = memo_poll(memo_listed(1..5))
+      assert Enum.all?(issues, &(&1.native_ref["parent_number"] == 7))
+      refute Enum.any?(calls, &String.ends_with?(&1, "/parent"))
+    end
+
+    test "dead owner degrades to no memo" do
+      listed = memo_listed([1])
+      assert {{:ok, _}, [_]} = memo_poll(listed)
+
+      pid = Process.whereis(HttpCache)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}
+
+      assert {{:ok, [_]}, [_]} = memo_poll(listed)
+      wait_until(fn -> is_pid(Process.whereis(HttpCache)) and Process.whereis(HttpCache) != pid end)
+    end
+  end
+
   defp tracker_settings(provider_overrides \\ %{}) do
     %{
       kind: "github",
@@ -933,7 +1033,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
       assert issue.dispatchable
     end
 
-    test "issue GET with a parent url triggers the parent fetch" do
+    test "issue GET with a parent url derives the parent number without /parent" do
       extra = fn
         "/repos/octo/repo/issues/42", _, _ ->
           {:ok, %{status: 200, body: Map.put(raw_issue(42), "parent_issue_url", "https://api.github.test/repos/octo/repo/issues/7")}}
@@ -946,7 +1046,7 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
       end
 
       assert {{:ok, [issue]}, calls} = lean_poll(zero_summaries(raw_issue(42)), extra)
-      assert calls == ["/repos/octo/repo/issues/42", "/repos/octo/repo/issues/42/parent"]
+      assert calls == ["/repos/octo/repo/issues/42"]
       assert issue.native_ref["parent_number"] == 7
     end
 
@@ -956,11 +1056,8 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
       refute issue.native_ref["has_parent"]
     end
 
-    test "parent_issue_url present in the payload fetches /parent without an issue GET" do
-      listed =
-        raw_issue(42)
-        |> zero_summaries()
-        |> Map.put("parent_issue_url", "https://api.github.test/repos/octo/repo/issues/7")
+    test "unparseable parent_issue_url falls back to /parent" do
+      listed = raw_issue(42) |> zero_summaries() |> Map.put("parent_issue_url", "https://x/weird")
 
       extra = fn
         "/repos/octo/repo/issues/42/parent", _, _ -> {:ok, %{status: 200, body: raw_issue(7)}}
@@ -968,6 +1065,16 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
       end
 
       assert {{:ok, [issue]}, ["/repos/octo/repo/issues/42/parent"]} = lean_poll(listed, extra)
+      assert issue.native_ref["parent_number"] == 7
+    end
+
+    test "parent_issue_url present in the payload needs no calls at all" do
+      listed =
+        raw_issue(42)
+        |> zero_summaries()
+        |> Map.put("parent_issue_url", "https://api.github.test/repos/octo/repo/issues/7")
+
+      assert {{:ok, [issue]}, []} = lean_poll(listed, fn _, _, _ -> nil end)
       assert issue.native_ref["parent_number"] == 7
     end
 

@@ -47,6 +47,22 @@ defmodule SymphonyElixir.GitHub.HttpCache do
     :ok
   end
 
+  @doc "Returns the enrichment-memo entry `{fingerprint, inserted_at_ms, value}` for `key`, or `nil`."
+  @spec memo_lookup(term()) :: {term(), integer(), term()} | nil
+  def memo_lookup(key) do
+    case safe(fn -> :ets.lookup(@table, {:enrich, key}) end, []) do
+      [{_key, fingerprint, inserted_at, value}] -> {fingerprint, inserted_at, value}
+      _ -> nil
+    end
+  end
+
+  @doc "Stores an enrichment-memo entry. No-op when the table is absent."
+  @spec memo_store(term(), term(), integer(), term()) :: :ok
+  def memo_store(key, fingerprint, inserted_at, value) do
+    safe(fn -> :ets.insert(@table, {{:enrich, key}, fingerprint, inserted_at, value}) end, nil)
+    :ok
+  end
+
   @doc "Returns the unix time until which `scope` is rate-limited, or `nil`."
   @spec blocked_until(term(), integer()) :: integer() | nil
   def blocked_until(scope, now_unix) do

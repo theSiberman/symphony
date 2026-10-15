@@ -13,6 +13,7 @@ defmodule SymphonyElixir.GitHub.Client do
   @page_size 100
   @user_agent "symphony"
   @default_enrichment_concurrency 8
+  @default_enrichment_memo_ttl_ms 600_000
   @retryable_statuses [408, 500, 502, 503, 504]
   @retryable_transport_reasons [:timeout, :econnrefused, :closed]
 
@@ -215,11 +216,49 @@ defmodule SymphonyElixir.GitHub.Client do
     if Enum.any?(labels, &(&1 in excluded)) do
       {:ok, %{drop_hints(issue) | dispatchable: false, priority_inheritable: false}}
     else
+      memoized_enrich(issue, settings, request_fun)
+    end
+  end
+
+  defp enrich_candidate(issue, settings, request_fun), do: memoized_enrich(issue, settings, request_fun)
+
+  # Enrichment memo (candidate polls only). An issue whose list-payload
+  # fingerprint (updated_at, dependency/sub-issue summaries, labels, state) is
+  # unchanged within the TTL reuses its enriched result with zero HTTP calls.
+  # GitHub bumps the blocked issue's dependency summary when a blocker closes,
+  # so unblocking changes the fingerprint; parent-label changes are bounded by
+  # the TTL. The state-refresh path (fetch_issues_by_ids) deliberately bypasses
+  # the memo: it must reflect live state and its single-issue payloads are not
+  # list payloads. Memo storage degrades to a miss/no-op if the ETS owner is down.
+  defp memoized_enrich(%Issue{id: id} = issue, settings, request_fun) do
+    ttl = Map.get(settings, :enrichment_memo_ttl_ms, @default_enrichment_memo_ttl_ms)
+    fingerprint = enrichment_fingerprint(issue, settings)
+
+    if ttl > 0 and not is_nil(fingerprint) do
+      key = {settings.api_url, settings.repo, id}
+      now = System.monotonic_time(:millisecond)
+
+      case HttpCache.memo_lookup(key) do
+        {^fingerprint, inserted_at, enriched} when now - inserted_at < ttl ->
+          {:ok, enriched}
+
+        _ ->
+          with {:ok, enriched} <- enrich_issue(issue, settings, request_fun) do
+            HttpCache.memo_store(key, fingerprint, now, enriched)
+            {:ok, enriched}
+          end
+      end
+    else
       enrich_issue(issue, settings, request_fun)
     end
   end
 
-  defp enrich_candidate(issue, settings, request_fun), do: enrich_issue(issue, settings, request_fun)
+  defp enrichment_fingerprint(%Issue{} = issue, settings) do
+    case get_in(issue.native_ref || %{}, ["enrich_hints", "fingerprint"]) do
+      nil -> nil
+      raw -> {raw, issue.state, issue.labels, settings.excluded_labels, settings.spec_issue_number}
+    end
+  end
 
   defp reduce_enriched_candidate({:ok, %Issue{} = issue}, acc, _settings),
     do: {:cont, {:ok, [issue | acc]}}
@@ -254,9 +293,19 @@ defmodule SymphonyElixir.GitHub.Client do
       |> put_zero_hint(issue, "sub_issues_summary", "total", "sub_issues_total")
       |> put_zero_hint(issue, "issue_dependencies_summary", "total_blocked_by", "blocked_by_total")
 
-    if Map.has_key?(issue, "parent_issue_url"),
-      do: Map.put(hints, "parent_issue_url", issue["parent_issue_url"]),
-      else: hints
+    hints =
+      if Map.has_key?(issue, "parent_issue_url"),
+        do: Map.put(hints, "parent_issue_url", issue["parent_issue_url"]),
+        else: hints
+
+    # Without a dependency or sub-issue summary there is nothing to detect
+    # unblocking with, so such payloads are never memoized.
+    if is_binary(issue["updated_at"]) and
+         (is_map(issue["issue_dependencies_summary"]) or is_map(issue["sub_issues_summary"])) do
+      Map.put(hints, "fingerprint", {issue["updated_at"], issue["issue_dependencies_summary"], issue["sub_issues_summary"]})
+    else
+      hints
+    end
   end
 
   defp put_zero_hint(hints, issue, summary_key, field, hint_key) do
@@ -300,7 +349,7 @@ defmodule SymphonyElixir.GitHub.Client do
         {:ok, :not_found}
 
       {:ok, url} when is_binary(url) ->
-        request_with_settings("GET", base_path <> "/parent", %{}, nil, settings, request_fun, true)
+        fetch_parent_by_url(url, base_path, settings, request_fun)
 
       _ ->
         # List payloads omit parent_issue_url; the single-issue GET is
@@ -308,12 +357,22 @@ defmodule SymphonyElixir.GitHub.Client do
         with {:ok, payload} <- request_with_settings("GET", base_path, %{}, nil, settings, request_fun, false) do
           case payload do
             %{"parent_issue_url" => url} when is_binary(url) ->
-              request_with_settings("GET", base_path <> "/parent", %{}, nil, settings, request_fun, true)
+              fetch_parent_by_url(url, base_path, settings, request_fun)
 
             _ ->
               {:ok, :not_found}
           end
         end
+    end
+  end
+
+  # Only the parent's number is consumed, and parent_issue_url ends in
+  # /issues/<number>, so a well-formed URL needs no /parent request (the
+  # dominant per-poll cost). Anything unparseable falls back to the fetch.
+  defp fetch_parent_by_url(url, base_path, settings, request_fun) do
+    case Regex.run(~r{/issues/(\d+)/?$}, url) do
+      [_, number] -> {:ok, %{"number" => String.to_integer(number)}}
+      _ -> request_with_settings("GET", base_path <> "/parent", %{}, nil, settings, request_fun, true)
     end
   end
 
@@ -621,8 +680,12 @@ defmodule SymphonyElixir.GitHub.Client do
       request_opts = if is_nil(body), do: request_opts, else: Keyword.put(request_opts, :json, body)
 
       case Req.request(Keyword.merge(request_opts, req_options)) do
-        {:ok, response} -> {:ok, handle_response(response, cache_key, cached, method, path, settings)}
-        {:error, reason} -> {:error, {:github_api_request, reason}}
+        {:ok, response} ->
+          Logger.debug("GitHub request method=#{method} path=#{path} status=#{response.status} cached=#{response.status == 304}")
+          {:ok, handle_response(response, cache_key, cached, method, path, settings)}
+
+        {:error, reason} ->
+          {:error, {:github_api_request, reason}}
       end
     end
   end
@@ -733,6 +796,7 @@ defmodule SymphonyElixir.GitHub.Client do
     spec_issue_number = provider["spec_issue_number"]
 
     enrichment_concurrency = Map.get(provider, "enrichment_concurrency", @default_enrichment_concurrency)
+    memo_ttl = Map.get(provider, "enrichment_memo_ttl_ms", @default_enrichment_memo_ttl_ms)
 
     cond do
       not valid_api_url?(api_url) ->
@@ -753,10 +817,14 @@ defmodule SymphonyElixir.GitHub.Client do
       not valid_enrichment_concurrency?(enrichment_concurrency) ->
         {:error, :invalid_github_enrichment_concurrency}
 
+      not (is_integer(memo_ttl) and memo_ttl >= 0) ->
+        {:error, :invalid_github_enrichment_memo_ttl_ms}
+
       true ->
         {:ok,
          %{
            api_url: String.trim_trailing(api_url, "/"),
+           enrichment_memo_ttl_ms: memo_ttl,
            repo: repo,
            token: token,
            spec_issue_number: spec_issue_number,
