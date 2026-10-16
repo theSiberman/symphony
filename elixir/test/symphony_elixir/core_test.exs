@@ -855,6 +855,51 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
+  test "reconcile logs the real reason when a new blocker stops a running issue" do
+    issue_id = "issue-new-blocker"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-563",
+          issue: %Issue{id: issue_id, identifier: "MT-563", state: "In Progress", dispatchable: true},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-563",
+      state: "In Progress",
+      assignee_id: "someone",
+      labels: [],
+      blocked_by: [%{"id" => "b1", "identifier" => "GH-1864", "state" => "open"}],
+      dispatchable: false
+    }
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+        refute Map.has_key?(updated_state.running, issue_id)
+      end)
+
+    assert log =~ "reason=blocked_by=[GH-1864]"
+    refute log =~ "assignee="
+  end
+
   test "reconcile stops running issue when a required label is removed" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
 

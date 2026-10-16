@@ -958,7 +958,7 @@ defmodule SymphonyElixir.Orchestrator do
         terminate_running_issue(state, issue.id, true)
 
       !issue_routable?(issue) ->
-        Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
+        Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} reason=#{unroutable_reason(issue)}; stopping active agent")
 
         terminate_running_issue(state, issue.id, false)
 
@@ -993,7 +993,7 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue.id)
 
       !issue_routable?(issue) ->
-        Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
+        Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} reason=#{unroutable_reason(issue)}; releasing block")
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
@@ -1592,6 +1592,28 @@ defmodule SymphonyElixir.Orchestrator do
   defp issue_routable?(%Issue{} = issue) do
     tracker = Config.settings!().tracker
     Issue.routable?(issue, tracker.required_labels, tracker.excluded_labels)
+  end
+
+  # Why issue_routable?/1 is false, for logs: open blockers, label mismatch, or
+  # not dispatchable (e.g. out of spec scope).
+  defp unroutable_reason(%Issue{} = issue) do
+    tracker = Config.settings!().tracker
+    labels = MapSet.new(issue.labels || [], &(&1 |> String.trim() |> String.downcase()))
+    norm = &(&1 |> String.trim() |> String.downcase())
+    missing = Enum.reject(tracker.required_labels, &MapSet.member?(labels, norm.(&1)))
+    excluded = Enum.filter(tracker.excluded_labels, &MapSet.member?(labels, norm.(&1)))
+    blockers = Enum.map(issue.blocked_by || [], &(&1["identifier"] || &1["id"]))
+
+    [
+      blockers != [] && "blocked_by=[#{Enum.join(blockers, ",")}]",
+      missing != [] && "missing_labels=[#{Enum.join(missing, ",")}]",
+      excluded != [] && "excluded_labels=[#{Enum.join(excluded, ",")}]"
+    ]
+    |> Enum.filter(& &1)
+    |> case do
+      [] -> "not_dispatchable"
+      reasons -> Enum.join(reasons, " ")
+    end
   end
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
