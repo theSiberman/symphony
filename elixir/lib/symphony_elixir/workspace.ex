@@ -1052,6 +1052,7 @@ defmodule SymphonyElixir.Workspace do
 
   defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
     build_issue_context(issue_id, identifier, integration_target(issue))
+    |> Map.put(:execution_profile, Map.get(issue, :execution_profile))
   end
 
   defp issue_context(identifier) when is_binary(identifier) do
@@ -1085,13 +1086,17 @@ defmodule SymphonyElixir.Workspace do
     parent_number = Map.get(issue_context, :issue_parent_number)
     integration_branch = Map.get(issue_context, :integration_branch, "main")
 
-    [
-      {"SYMPHONY_OWNER_PID", System.pid()},
-      {"SYMPHONY_ISSUE_ID", issue_id || ""},
-      {"SYMPHONY_ISSUE_IDENTIFIER", issue_identifier || "issue"},
-      {"SYMPHONY_ISSUE_PARENT_NUMBER", if(is_integer(parent_number), do: Integer.to_string(parent_number), else: "")},
-      {"SYMPHONY_INTEGRATION_BRANCH", integration_branch}
-    ]
+    route = Map.get(issue_context, :execution_profile) || %{}
+    profile_env = if route == %{}, do: [], else: [{"ADAMA_EXECUTION_PROFILE", route["profile"]}, {"ADAMA_PROFILE_REASON", route["reason"]}]
+
+    profile_env ++
+      [
+        {"SYMPHONY_OWNER_PID", System.pid()},
+        {"SYMPHONY_ISSUE_ID", issue_id || ""},
+        {"SYMPHONY_ISSUE_IDENTIFIER", issue_identifier || "issue"},
+        {"SYMPHONY_ISSUE_PARENT_NUMBER", if(is_integer(parent_number), do: Integer.to_string(parent_number), else: "")},
+        {"SYMPHONY_INTEGRATION_BRANCH", integration_branch}
+      ]
   end
 
   defp hook_environment_script(issue_context) do

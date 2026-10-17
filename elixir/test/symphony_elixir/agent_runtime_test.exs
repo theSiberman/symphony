@@ -93,6 +93,19 @@ defmodule SymphonyElixir.AgentRuntimeTest do
                  })
 
         assert :ok = AgentRuntime.stop_session(session)
+
+        # Existing callers may still hold a raw session created before profile
+        # support. Exercise that public compatibility path through real stdio.
+        assert {:ok, legacy_session} = CodexAdapter.start_session(workspace, [])
+
+        assert {:ok, %{thread_id: "thread-runtime", turn_id: "turn-runtime"}} =
+                 AgentRuntime.run_turn(legacy_session, "resume the unprofiled session", %{
+                   id: "runtime-issue",
+                   identifier: "MT-RUNTIME",
+                   title: "Legacy runtime delegation"
+                 })
+
+        assert :ok = AgentRuntime.stop_session(legacy_session)
       after
         File.rm_rf(test_root)
       end

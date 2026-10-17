@@ -162,6 +162,7 @@ defmodule SymphonyElixir.Config.Schema do
       # Selects the AgentRuntime adapter. Defaults to codex so every existing
       # workflow file keeps its meaning without an edit.
       field(:kind, :string, default: "codex")
+      field(:profile_command, :string)
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:admission_command, :string)
@@ -180,6 +181,7 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :kind,
+          :profile_command,
           :max_concurrent_agents,
           :max_turns,
           :admission_command,
