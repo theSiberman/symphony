@@ -49,6 +49,26 @@ Unreadable or mismatched markers block
 admission visibly. Temporary provider and tracker errors retain the abnormal
 count and retry with a positive backoff.
 
+## Per-Ticket executor profiles
+
+`agent.profile_command` is optional. Existing workflows continue using `agent.kind`.
+The command receives one normalized Issue JSON line on stdin and returns one JSON
+object with nonempty `profile`, `reason`, `kind`, `model`, and `effort` fields.
+`kind` must name an existing `codex` or `opencode` adapter. Codex routes also require
+`command`, a trusted deployment launch command; Ticket text must never become shell code.
+OpenCode routes override the session's `model` and `variant` while retaining shared
+endpoint and sandbox settings. The command is bounded to ten seconds; invalid output
+or failure prevents the attempt from starting a model.
+
+The deployment owns labels, size rules and role model pins. Symphony resolves a
+route once per attempt, records the exact JSON at `.context/execution-profile.json`,
+and passes `ADAMA_EXECUTION_PROFILE` and `ADAMA_PROFILE_REASON` to workspace hooks.
+The session keeps its adapter through continuation and teardown even after a global
+configuration reload. Profile selection does not claim, promote or dispatch issues;
+the existing scheduler admission and ownership rules still govern those actions.
+Receipt persistence supports local workers. Profiled SSH workers fail closed;
+existing unprofiled SSH workers continue without local receipt operations.
+
 ## Screenshot
 
 ![Symphony Elixir screenshot](../.github/media/elixir-screenshot.png)

@@ -31,6 +31,9 @@ hooks:
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
 agent:
+  # Optional trusted deployment router: one normalized Issue JSON line on stdin,
+  # one {profile,reason,kind,model,effort,command?} JSON route on stdout.
+  # profile_command: /path/to/deployment/bin/executor-profile.py select-ticket
   # Optional host admission; requires GNU timeout on the scheduler host.
   # Receives SYMPHONY_ADMISSION_CONTEXT with candidate/running workspace identities.
   # admission_command: /deployment/bin/check-capacity

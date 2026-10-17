@@ -73,13 +73,21 @@ defmodule SymphonyElixir.AgentRuntime do
   def supported_kinds, do: @adapters |> Map.keys() |> Enum.sort()
 
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
-  def start_session(workspace, opts \\ []), do: adapter().start_session(workspace, opts)
+  def start_session(workspace, opts \\ []) do
+    with {:ok, owner} <- adapter_for_kind(Keyword.get(opts, :runtime_kind, Config.settings!().agent.kind)),
+         {:ok, session} <- owner.start_session(workspace, opts) do
+      {:ok, %{adapter: owner, handle: session}}
+    end
+  end
+
+  def run_turn(session, prompt, issue, opts \\ [])
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
-  def run_turn(session, prompt, issue, opts \\ []),
-    do: adapter().run_turn(session, prompt, issue, opts)
+  def run_turn(%{adapter: owner, handle: handle}, prompt, issue, opts), do: owner.run_turn(handle, prompt, issue, opts)
+  def run_turn(session, prompt, issue, opts), do: adapter().run_turn(session, prompt, issue, opts)
 
   @spec stop_session(session()) :: :ok
+  def stop_session(%{adapter: owner, handle: handle}), do: owner.stop_session(handle)
   def stop_session(session), do: adapter().stop_session(session)
 
   @spec capabilities() :: capabilities()
@@ -111,11 +119,18 @@ defmodule SymphonyElixir.AgentRuntime do
     Map.get(capabilities(), :streams_progress, true)
   end
 
-  @spec classify_failure(term()) :: :transient | :terminal
-  def classify_failure(reason), do: adapter().classify_failure(reason)
+  @spec classify_failure(term(), String.t() | nil) :: :transient | :terminal
+  def classify_failure(reason, kind \\ nil), do: selected_adapter(kind).classify_failure(reason)
 
-  @spec extract_usage(map()) :: {map(), map() | nil}
-  def extract_usage(update), do: adapter().extract_usage(update)
+  @spec extract_usage(map(), String.t() | nil) :: {map(), map() | nil}
+  def extract_usage(update, kind \\ nil), do: selected_adapter(kind).extract_usage(update)
+
+  defp selected_adapter(nil), do: adapter()
+
+  defp selected_adapter(kind) do
+    {:ok, owner} = adapter_for_kind(kind)
+    owner
+  end
 
   @spec validate_config(map()) :: :ok | {:error, term()}
   def validate_config(settings) do

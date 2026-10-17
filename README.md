@@ -8,6 +8,11 @@ manifests, one-shot resume and exact live-turn preconditions.
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
+An optional deployment-owned `agent.profile_command` chooses a Codex or OpenCode
+profile separately for each Ticket. Concurrent workers retain their own adapter
+and route through session completion; changing the scheduler's default does not
+switch an existing session. See the [per-Ticket profile contract](elixir/README.md#per-ticket-executor-profiles).
+
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 
 _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._

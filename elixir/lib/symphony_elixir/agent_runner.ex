@@ -4,7 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.{AgentRuntime, Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRuntime, Config, ExecutionProfile, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -24,7 +24,13 @@ defmodule SymphonyElixir.AgentRunner do
 
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    result =
+      with {:ok, route} <- ExecutionProfile.resolve(issue) do
+        issue = Map.put(issue, :execution_profile, route)
+        run_on_worker_host(issue, codex_update_recipient, opts, worker_host)
+      end
+
+    case result do
       :ok ->
         :ok
 
@@ -42,7 +48,8 @@ defmodule SymphonyElixir.AgentRunner do
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          with :ok <- ExecutionProfile.persist(workspace, issue.execution_profile, worker_host),
+               :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
             run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
         after
@@ -68,14 +75,17 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id} = issue, worker_host, workspace)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
     send(
       recipient,
       {:worker_runtime_info, issue_id,
        %{
          worker_host: worker_host,
-         workspace_path: workspace
+         workspace_path: workspace,
+         runtime_kind: runtime_kind(issue),
+         execution_profile: Map.get(issue, :execution_profile),
+         capabilities: runtime_capabilities(issue)
        }}
     )
 
@@ -88,7 +98,8 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    session_opts = [worker_host: worker_host, issue_identifier: issue.identifier]
+    profile_opts = ExecutionProfile.session_options(issue.execution_profile)
+    session_opts = [worker_host: worker_host, issue_identifier: issue.identifier] ++ profile_opts
 
     with {:ok, session} <- AgentRuntime.start_session(workspace, session_opts) do
       try do
@@ -97,6 +108,13 @@ defmodule SymphonyElixir.AgentRunner do
         AgentRuntime.stop_session(session)
       end
     end
+  end
+
+  defp runtime_kind(issue), do: get_in(Map.get(issue, :execution_profile) || %{}, ["kind"]) || Config.settings!().agent.kind
+
+  defp runtime_capabilities(issue) do
+    {:ok, adapter} = AgentRuntime.adapter_for_kind(runtime_kind(issue))
+    adapter.capabilities()
   end
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do

@@ -273,6 +273,10 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_put_runtime_value(:runtime_kind, runtime_info[:runtime_kind])
+          |> maybe_put_runtime_value(:execution_profile, runtime_info[:execution_profile])
+          |> Map.put(:steering_supported, get_in(runtime_info, [:capabilities, :steering]) == true)
+          |> Map.put(:streams_progress, get_in(runtime_info, [:capabilities, :streams_progress]) != false)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -293,7 +297,7 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           state
           |> apply_codex_token_delta(token_delta)
-          |> apply_agent_rate_limits(update)
+          |> apply_agent_rate_limits(update, running_entry[:runtime_kind])
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -364,7 +368,7 @@ defmodule SymphonyElixir.Orchestrator do
     Logger.warning("Agent task exited for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id} reason=#{inspect(reason)}; handling failure")
 
     next_attempt =
-      if transient_failure?(reason),
+      if transient_failure?(reason, running_entry[:runtime_kind]),
         do: Map.get(running_entry, :retry_attempt, 0),
         else: next_retry_attempt_from_running(running_entry) || 1
 
@@ -401,14 +405,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp operator_failure?({:agent_failed, {:workspace_hook_failed, _hook, 78, _output}}), do: true
   defp operator_failure?(_reason), do: false
 
-  defp transient_failure?({:agent_failed, {:issue_state_refresh_failed, _detail}}), do: true
+  defp transient_failure?({:agent_failed, {:issue_state_refresh_failed, _detail}}, _kind), do: true
 
   # The runtime owns its own error shape; the orchestrator owns the retry budget.
-  defp transient_failure?({:agent_failed, {kind, _detail} = failure})
+  defp transient_failure?({:agent_failed, {kind, _detail} = failure}, runtime_kind)
        when kind in [:response_error, :turn_failed],
-       do: AgentRuntime.classify_failure(failure) == :transient
+       do: AgentRuntime.classify_failure(failure, runtime_kind) == :transient
 
-  defp transient_failure?(_reason), do: false
+  defp transient_failure?(_reason, _kind), do: false
 
   # Normalize this at the originating adapter: agent.kind can reload while a
   # turn is running, so its budget must not be reclassified by the new adapter.
@@ -1121,9 +1125,6 @@ defmodule SymphonyElixir.Orchestrator do
       # A runtime that reports only at turn boundaries is silent for the whole
       # turn by design; "time since last update" is not a liveness signal for it,
       # and its bound is the turn budget instead.
-      not AgentRuntime.progress_silence_implies_stall?() ->
-        state
-
       map_size(state.running) == 0 ->
         state
 
@@ -1137,7 +1138,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
-    if Map.has_key?(state.blocked, issue_id) do
+    if Map.has_key?(state.blocked, issue_id) or not Map.get(running_entry, :streams_progress, AgentRuntime.progress_silence_implies_stall?()) do
       state
     else
       restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms)
@@ -1706,7 +1707,8 @@ defmodule SymphonyElixir.Orchestrator do
         running =
           Map.put(state.running, issue.id, %{
             pid: pid,
-            steering_supported: Map.get(AgentRuntime.capabilities(), :steering, false),
+            steering_supported: false,
+            runtime_kind: Config.settings!().agent.kind,
             ref: ref,
             identifier: issue.identifier,
             issue: issue,
@@ -2450,8 +2452,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_codex_token_delta(state, _token_delta), do: state
 
-  defp apply_agent_rate_limits(%State{} = state, update) when is_map(update) do
-    case elem(AgentRuntime.extract_usage(update), 1) do
+  defp apply_agent_rate_limits(%State{} = state, update, kind) when is_map(update) do
+    case elem(AgentRuntime.extract_usage(update, kind), 1) do
       %{} = rate_limits ->
         %{state | agent_rate_limits: rate_limits}
 
@@ -2460,7 +2462,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp apply_agent_rate_limits(state, _update), do: state
+  defp apply_agent_rate_limits(state, _update, _kind), do: state
 
   defp apply_token_delta(codex_totals, token_delta) do
     input_tokens = Map.get(codex_totals, :input_tokens, 0) + token_delta.input_tokens
@@ -2480,7 +2482,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp extract_token_delta(running_entry, %{event: _, timestamp: _} = update) do
     running_entry = running_entry || %{}
-    usage = elem(AgentRuntime.extract_usage(update), 0)
+    usage = elem(AgentRuntime.extract_usage(update, running_entry[:runtime_kind]), 0)
 
     {
       compute_token_delta(
